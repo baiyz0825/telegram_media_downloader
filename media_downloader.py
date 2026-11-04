@@ -31,7 +31,7 @@ from module.pyrogram_extension import (
 )
 from module.task_store import TaskStore
 from module.web import init_web
-from utils.format import truncate_filename, validate_title
+from utils.format import is_generic_filename, truncate_filename, validate_title
 from utils.log import LogFilter
 from utils.meta import print_meta
 from utils.meta_data import MetaData
@@ -246,9 +246,17 @@ async def _get_media_meta(
         if not file_name and message.photo:
             file_name = f"{message.photo.file_unique_id}"
 
-        gen_file_name = (
-            app.get_file_name(message.id, file_name, caption) + file_name_suffix
-        )
+        if caption and is_generic_filename(file_name):
+            # Captions are a better filename than opaque Telegram generated
+            # ids. Respect a configured caption component without duplicating
+            # it when the current format already includes ``caption``.
+            if "caption" in app.file_name_prefix:
+                generated_name = app.get_file_name(message.id, None, caption)
+            else:
+                generated_name = app.get_file_name(message.id, caption, None)
+        else:
+            generated_name = app.get_file_name(message.id, file_name, caption)
+        gen_file_name = generated_name + file_name_suffix
 
         file_save_path = app.get_file_save_path(_type, dirname, datetime_dir_name)
 

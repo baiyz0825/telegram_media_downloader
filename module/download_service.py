@@ -100,9 +100,24 @@ class DownloadService:
             ),
             None,
         )
-        payload["file_name"] = (
-            getattr(media, "file_name", None) or "消息 #%s" % message.id
+        from utils.format import is_generic_filename, truncate_filename, validate_title
+
+        source_file_name = getattr(media, "file_name", None) if media else None
+        grouped_caption = getattr(self.app, "get_caption_name", lambda *_: None)(
+            node.chat_id, getattr(message, "media_group_id", None)
         )
+        caption = payload["caption"] or grouped_caption or payload["text"]
+        payload["caption"] = caption
+        if source_file_name:
+            source_file_name = os.path.basename(source_file_name)
+        if caption and is_generic_filename(source_file_name):
+            suffix = os.path.splitext(source_file_name or "")[1]
+            display_name = validate_title(caption.strip()) + suffix
+        else:
+            display_name = source_file_name or caption or "消息 #%s" % message.id
+        display_name = truncate_filename(validate_title(display_name))
+        payload["file_name"] = display_name
+        payload["display_name"] = display_name
         if node.task_type != TaskType.Download and not node.has_protected_content:
             payload["kind"] = "forward"
         key = "download:%s:%s:%s" % (
@@ -270,6 +285,7 @@ class DownloadService:
         )
         target, _, extension = await self.metadata(node.chat_id, message, media, kind)
         row["payload"]["file_name"] = os.path.basename(target)
+        row["payload"]["display_name"] = os.path.basename(target)
         self.store.refresh_payload(row["id"], row["payload"], token=row["claim_token"])
         if not self.can_download(kind, self.app.file_formats, extension):
             return {"skipped": True, "reason": "file format filter"}

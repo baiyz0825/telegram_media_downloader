@@ -368,6 +368,28 @@ class MediaDownloaderTestCase(unittest.TestCase):
         app.loop = cls.loop
         rest_app(MOCK_CONF)
 
+    def test_generated_filename_uses_caption_with_default_prefix(self):
+        rest_app(MOCK_CONF)
+        previous_prefix = app.file_name_prefix
+        try:
+            app.file_name_prefix = ["message_id", "file_name"]
+            message = MockMessage(
+                id=21,
+                media=True,
+                chat_title="test-caption",
+                caption="A detailed caption",
+                video=MockVideo(
+                    file_name="20261023_094616_85c652.mp4",
+                    mime_type="video/mp4",
+                ),
+            )
+            target, _, _ = self.loop.run_until_complete(
+                async_get_media_meta(-123, message, message.video, "video")
+            )
+            self.assertEqual(os.path.basename(target), "21 - A detailed caption.mp4")
+        finally:
+            app.file_name_prefix = previous_prefix
+
     # @mock.patch("media_downloader.app.save_path", new=MOCK_DIR)
     def test_get_media_meta(self):
         rest_app(MOCK_CONF)

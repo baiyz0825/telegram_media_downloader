@@ -273,6 +273,26 @@ def validate_title(title: str) -> str:
     return new_title
 
 
+def is_generic_filename(file_name: Optional[str]) -> bool:
+    """Return whether a media filename carries little human-readable context.
+
+    Telegram uploads often use generated timestamps, ids, or names such as
+    ``video_12345``. A message caption is more useful in those cases.
+    """
+    if not file_name:
+        return True
+    stem = os.path.splitext(os.path.basename(file_name))[0].strip()
+    if not stem:
+        return True
+    return bool(
+        re.fullmatch(
+            r"(?i)(?:(?:file|video|document|photo|image)[_-]?)?(?:\d{6,}|[0-9a-f]{8,})",
+            stem,
+        )
+        or re.fullmatch(r"\d{8}[-_]\d{6}(?:[-_][0-9a-f]{4,})?", stem, re.I)
+    )
+
+
 def create_progress_bar(progress, total_bars=10):
     """
     example

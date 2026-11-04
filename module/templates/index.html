@@ -94,10 +94,16 @@
       for (const row of rows) {
         visibleIds.add(row.id);
         const payload = row.payload || {}, tr = document.createElement('tr'), fileCell = document.createElement('td');
-        const path = row.path || payload.file_name || '', filename = path.split(/[\\/]/).pop() || '消息 #' + (payload.message_id || row.id);
+        const currentPath = row.path || '', isPartial = /\.(?:part|tmp)$/i.test(currentPath);
+        const savedName = currentPath.split(/[\\/]/).pop();
+        const sourceName = payload.file_name || '';
+        const sourceStem = sourceName.split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
+        const generatedName = /^(?:(?:file|video|document|photo|image)[_-]?)?(?:\d{6,}|[0-9a-f]{8,})$/i.test(sourceStem) || /^\d{8}[-_]\d{6}(?:[-_][0-9a-f]{4,})?$/i.test(sourceStem);
+        const plannedName = payload.display_name || (generatedName ? (payload.caption || sourceName) : (sourceName || payload.caption || payload.text)) || '消息 #' + (payload.message_id || row.id);
+        const filename = currentPath && !isPartial ? savedName : plannedName;
         const file = text('div', '', 'file-name');
         file.append(text('span', row.state === 'completed' ? '✓' : '↓', 'file-icon'), text('strong', filename));
-        file.title = path || filename; fileCell.append(file);
+        file.title = filename; fileCell.append(file);
         fileCell.append(text('div', '#' + row.id + ' · 来源 ' + (payload.source_name || payload.chat_title || payload.chat_id || row.group_id || 'Telegram') + ' · 尝试 ' + row.attempt + '/' + row.max_attempts, 'file-meta'));
         if (row.error) { const error = text('div', row.error, 'task-error'); error.title = row.error; fileCell.append(error); }
         tr.append(fileCell);

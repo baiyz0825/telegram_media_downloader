@@ -101,6 +101,17 @@ class DownloadServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.queue.execute(claimed)
         return self.store.get(task["id"])
 
+    async def test_caption_is_queue_display_name_when_media_name_is_missing(self):
+        self.client.message.caption = "一段能说明内容的消息简介"
+        row = self.service.enqueue(self.client.message, self.node)
+        self.assertEqual(row["payload"]["display_name"], "一段能说明内容的消息简介")
+
+    async def test_caption_replaces_generated_filename_in_queue_display(self):
+        self.client.message.caption = "一段能说明内容的消息简介"
+        self.client.message.video.file_name = "20261023_094616_85c652.mp4"
+        row = self.service.enqueue(self.client.message, self.node)
+        self.assertEqual(row["payload"]["display_name"], "一段能说明内容的消息简介.mp4")
+
     async def test_download_upload_handoff_survives_process_restart(self):
         self.app.cloud_drive_config.enable_upload_file = True
         task = await self.execute_download()
