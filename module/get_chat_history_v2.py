@@ -61,38 +61,40 @@ async def get_chat_history_v2(
     """Get messages from a chat history."""
     current = 0
     total = limit or (1 << 31) - 1
-    limit = min(100, total)
+    page_size = min(100, total)
+    cursor = offset_id
 
     while True:
         messages = await get_chunk_v2(
             client=self,
             chat_id=chat_id,
-            limit=limit,
+            limit=min(page_size, total - current),
             offset=offset,
             max_id=max_id + 1 if max_id else 0,
-            from_message_id=offset_id,
+            from_message_id=cursor,
             from_date=offset_date,
             reverse=reverse,
         )
 
-        if not messages:
-            break_count = offset_id - 1
-            async for message in self.get_chat_history(chat_id):
-                if break_count:
-                    break_count -= 1
-                    continue
-                if len(messages) >= limit + 1:
-                    break
-                messages.append(message)
-            if not messages:
-                return
-
-        offset_id = messages[-1].id + (1 if reverse else 0)
-
-        for message in messages:
+        # IDs are boundaries, never counts: deleted IDs leave arbitrary gaps.
+        # Sorting and an exclusive moving boundary also reject overlapping or
+        # repeated pages without retaining the full channel's IDs in memory.
+        candidates = {
+            message.id: message
+            for message in messages
+            if message.id > 0
+            and (not max_id or message.id <= max_id)
+            and (
+                not cursor or (message.id >= cursor if reverse else message.id < cursor)
+            )
+        }
+        if not candidates:
+            return
+        for message_id in sorted(candidates, reverse=not reverse):
+            message = candidates[message_id]
             yield message
-
             current += 1
-
             if current >= total:
                 return
+        cursor = max(candidates) + 1 if reverse else min(candidates)
+        offset = 0

@@ -1,7 +1,9 @@
 """Application module"""
 
 import asyncio
+import functools
 import os
+import tempfile
 import time
 from asyncio import Lock
 from concurrent.futures import ThreadPoolExecutor
@@ -175,6 +177,7 @@ class TaskNode:
         self.topic_id = topic_id
         self.reply_to_message = None
         self.cloud_drive_upload_stat_dict: dict = {}
+        self.task_store = None
 
     def skip_msg_id(self, msg_id: int):
         """Skip if message id out of range"""
@@ -188,6 +191,15 @@ class TaskNode:
 
     def is_finish(self):
         """If is finish"""
+        if self.task_store and self.task_type != TaskType.ListenForward:
+            stats = self.task_store.stats(group_id=str(self.task_id))
+            return self.is_stop_transmission or (
+                bool(stats["total"])
+                and not any(
+                    stats[state]
+                    for state in ("queued", "running", "retry_wait", "paused")
+                )
+            )
         return self.is_stop_transmission or (
             self.is_running
             and self.task_type != TaskType.ListenForward
@@ -395,9 +407,19 @@ class Application:
         self.caption_name_dict: dict = {}
         self.caption_entities_dict: dict = {}
         self.max_concurrent_transmissions: int = 1
-        self.web_host: str = "0.0.0.0"
+        self.web_host: str = "127.0.0.1"
         self.web_port: int = 5000
         self.max_download_task: int = 5
+        self.max_upload_task = 2
+        self.max_retries = 5
+        self.retry_base_delay = 3
+        self.request_timeout = 60
+        self.idle_timeout = 60
+        self.task_db_path = os.path.join(self.session_file_path, "tasks.db")
+        self.media_directories = []
+        self.task_store = None
+        self.download_service = None
+        self.initial_scan_done = False
         self.language = Language.EN
         self.after_upload_telegram_delete: bool = True
         self.web_login_secret: str = ""
@@ -502,6 +524,29 @@ class Application:
         self.max_download_task = _config.get(
             "max_download_task", self.max_download_task
         )
+        for key in (
+            "max_download_task",
+            "max_upload_task",
+            "max_retries",
+            "retry_base_delay",
+            "request_timeout",
+            "idle_timeout",
+        ):
+            value = _config.get(key, getattr(self, key))
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or value <= 0
+            ):
+                raise ValueError("%s must be positive" % key)
+            setattr(self, key, int(value))
+        self.task_db_path = _config.get("task_db_path", self.task_db_path)
+        roots = _config.get("media_directories", [])
+        if not isinstance(roots, list) or any(
+            not isinstance(root, str) for root in roots
+        ):
+            raise ValueError("media_directories must be a list of paths")
+        self.media_directories = [os.path.abspath(root) for root in roots]
 
         self.max_concurrent_transmissions = self.max_download_task * 5
 
@@ -707,8 +752,11 @@ class Application:
         elif self.cloud_drive_config.upload_adapter == "aligo":
             ret = await self.loop.run_in_executor(
                 self.executor,
-                CloudDrive.aligo_upload_file(
-                    self.cloud_drive_config, self.save_path, local_file_path
+                functools.partial(
+                    CloudDrive.aligo_upload_file,
+                    self.cloud_drive_config,
+                    self.save_path,
+                    local_file_path,
                 ),
             )
 
@@ -897,12 +945,25 @@ class Application:
         self.config["group_add_advertisement"] = self.group_add_advertisement
 
         if immediate:
-            with open(self.config_file, "w", encoding="utf-8") as yaml_file:
-                _yaml.dump(self.config, yaml_file)
+            self._atomic_yaml(self.config_file, self.config)
 
         if immediate:
-            with open(self.app_data_file, "w", encoding="utf-8") as yaml_file:
-                _yaml.dump(self.app_data, yaml_file)
+            self._atomic_yaml(self.app_data_file, self.app_data)
+
+    @staticmethod
+    def _atomic_yaml(path, data):
+        """Flush a complete replacement before replacing the previous config."""
+        directory = os.path.dirname(os.path.abspath(path))
+        descriptor, temporary = tempfile.mkstemp(prefix=".config-", dir=directory)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                _yaml.dump(data, output)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
 
     def set_language(self, language: Language):
         """Set Language"""

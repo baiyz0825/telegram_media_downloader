@@ -1,7 +1,10 @@
 """Multi language support"""
 
 # disable pylint: disable = C0301
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
+from typing import Optional
 
 
 class Language(Enum):
@@ -14,6 +17,9 @@ class Language(Enum):
 
 
 _language = Language.EN
+_request_language: ContextVar[Optional[Language]] = ContextVar(
+    "telegram_request_language", default=None
+)
 
 
 def set_language(language: Language):
@@ -23,7 +29,57 @@ def set_language(language: Language):
     _language = language
 
 
+def get_language() -> Language:
+    """Use this task's language, falling back to the application's default."""
+    return _request_language.get() or _language
+
+
+@contextmanager
+def use_language(language=None):
+    """Temporarily localize one async task and restore its previous context.
+
+    ContextVar values are copied when asyncio creates a task; two concurrent
+    users therefore cannot overwrite each other's translations. Persisted tasks
+    may supply an enum name instead of a live Enum instance.
+    """
+    if isinstance(language, str):
+        language = Language.__members__.get(language.upper())
+    if language is not None and not isinstance(language, Language):
+        language = None
+    token = _request_language.set(language)
+    try:
+        yield get_language()
+    finally:
+        _request_language.reset(token)
+
+
 translations = {
+    "Manage persistent download queue": [
+        "管理持久化下载队列",
+        "Управление очередью загрузок",
+        "Керування чергою завантажень",
+    ],
+    "Queued": ["排队中", "В очереди", "У черзі"],
+    "Running": ["执行中", "Выполняется", "Виконується"],
+    "Waiting to retry": ["等待重试", "Ожидание повтора", "Очікування повтору"],
+    "Paused": ["已暂停", "Приостановлено", "Призупинено"],
+    "Cancelled": ["已取消", "Отменено", "Скасовано"],
+    "Completed": ["已完成", "Завершено", "Завершено"],
+    "Pause": ["暂停", "Пауза", "Пауза"],
+    "Resume": ["继续", "Продолжить", "Продовжити"],
+    "Cancel": ["取消", "Отменить", "Скасувати"],
+    "Prioritize": ["插队", "Повысить приоритет", "Підвищити пріоритет"],
+    "Retry": ["重试", "Повторить", "Повторити"],
+    "Refresh": ["刷新", "Обновить", "Оновити"],
+    "Scanning": ["扫描消息", "Сканирование сообщений", "Сканування повідомлень"],
+    "Downloading file": ["下载文件", "Загрузка файла", "Завантаження файлу"],
+    "Verifying": ["校验文件", "Проверка файла", "Перевірка файлу"],
+    "Verified": ["文件已校验", "Файл проверен", "Файл перевірено"],
+    "Uploaded": ["上传完成", "Отправлено", "Вивантажено"],
+    "Uploading": ["上传中", "Отправка", "Вивантаження"],
+    "Attempt": ["尝试", "Попытка", "Спроба"],
+    "Retry in seconds": ["距离重试秒数", "Секунд до повтора", "Секунд до повтору"],
+    "Reason": ["原因", "Причина", "Причина"],
     "Forward": ["转发", "Переслать", "Переслати"],
     "Total": ["总数", "Всего", "Всього"],
     "Success": ["成功", "Успешно", "Успішно"],
@@ -300,10 +356,11 @@ def _t(text: str):
     -------
     str
     """
-    if _language is Language.EN:
+    language = get_language()
+    if language is Language.EN:
         return text
 
     if text in translations:
-        return translations[text][_language.value - 2]
+        return translations[text][language.value - 2]
 
     return text

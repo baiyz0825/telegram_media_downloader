@@ -1,5 +1,6 @@
 """Downloads media from telegram."""
 import asyncio
+import hashlib
 import logging
 import os
 import shutil
@@ -13,6 +14,7 @@ from rich.logging import RichHandler
 
 from module.app import Application, ChatDownloadConfig, DownloadStatus, TaskNode
 from module.bot import start_download_bot, stop_download_bot
+from module.download_service import DownloadService
 from module.download_stat import update_download_status
 from module.get_chat_history_v2 import get_chat_history_v2
 from module.language import _t
@@ -27,6 +29,7 @@ from module.pyrogram_extension import (
     update_cloud_upload_stat,
     upload_telegram_chat,
 )
+from module.task_store import TaskStore
 from module.web import init_web
 from utils.format import truncate_filename, validate_title
 from utils.log import LogFilter
@@ -262,6 +265,18 @@ async def add_download_task(
     """Add Download task"""
     if message.empty:
         return False
+    if app.download_service:
+        row = app.download_service.enqueue(message, node)
+        if message.id not in node.download_status:
+            node.total_task += 1
+        node.download_status[message.id] = (
+            DownloadStatus.SkipDownload
+            if row["state"] == "completed"
+            else DownloadStatus.FailedDownload
+            if row["state"] in ("failed", "cancelled")
+            else DownloadStatus.Downloading
+        )
+        return row["state"] not in ("cancelled", "failed")
     node.download_status[message.id] = DownloadStatus.Downloading
     await queue.put((message, node))
     node.total_task += 1
@@ -307,9 +322,6 @@ async def download_task(
     if app.enable_download_txt and message.text and not message.media:
         download_status, file_name = await save_msg_to_file(app, node.chat_id, message)
 
-    if not node.bot:
-        app.set_download_id(node, message.id, download_status)
-
     node.download_status[message.id] = download_status
 
     file_size = os.path.getsize(file_name) if file_name else 0
@@ -343,6 +355,8 @@ async def download_task(
         download_status,
         file_size,
     )
+    if not node.bot:
+        app.set_download_id(node, message.id, download_status)
 
 
 # pylint: disable = R0915,R0914
@@ -413,7 +427,7 @@ async def download_media(
             if _can_download(_type, file_formats, file_format):
                 if _is_exist(file_name):
                     file_size = os.path.getsize(file_name)
-                    if file_size or file_size == media_size:
+                    if media_size and file_size == media_size:
                         logger.info(
                             f"id={message.id} {ui_file_name} "
                             f"{_t('already download,download skipped')}.\n"
@@ -544,18 +558,32 @@ async def download_chat_task(
     node: TaskNode,
 ):
     """Download all task"""
+    if app.download_service:
+        return app.download_service.enqueue_scan(chat_download_config, node)
+    return await _scan_chat_task(client, chat_download_config, node)
+
+
+async def _scan_chat_task(client, chat_download_config, node, scan_row=None):
+    """Discover bounded metadata pages, committing each child before the cursor."""
+    cursor = scan_row["payload"].get("scan_cursor", 0) if scan_row else 0
+    scanned_count = scan_row["payload"].get("scanned_count", 0) if scan_row else 0
+    if scan_row and node.limit and scanned_count >= node.limit:
+        return
+    page_count = 0
     messages_iter = get_chat_history_v2(
         client,
         node.chat_id,
-        limit=node.limit,
+        limit=max(0, node.limit - scanned_count) if node.limit else 0,
         max_id=node.end_offset_id,
-        offset_id=chat_download_config.last_read_message_id,
+        offset_id=max(
+            chat_download_config.last_read_message_id, cursor + 1 if cursor else 0
+        ),
         reverse=True,
     )
 
     chat_download_config.node = node
 
-    if chat_download_config.ids_to_retry:
+    if chat_download_config.ids_to_retry and not cursor:
         logger.info(f"{_t('Downloading files failed during last run')}...")
         skipped_messages: list = await client.get_messages(  # type: ignore
             chat_id=node.chat_id, message_ids=chat_download_config.ids_to_retry
@@ -565,6 +593,20 @@ async def download_chat_task(
             await add_download_task(message, node)
 
     async for message in messages_iter:  # type: ignore
+        if scan_row:
+            await app.download_service.queue.control(scan_row)
+            # Bound outstanding discovery, including paused children. This also
+            # lets consumers from other groups run while a large chat is scanned.
+            if (
+                sum(
+                    app.task_store.stats(scan_row["group_id"])[state]
+                    for state in ("queued", "running", "retry_wait", "paused")
+                )
+                > 500
+            ):
+                app.task_store.release(scan_row["id"], scan_row["claim_token"])
+                await asyncio.sleep(0.2)
+                return
         meta_data = MetaData()
 
         caption = message.caption
@@ -594,6 +636,17 @@ async def download_chat_task(
                     message,
                     DownloadStatus.SkipDownload,
                 )
+        if scan_row:
+            scanned_count += 1
+            page_count += 1
+            scan_row["payload"]["scan_cursor"] = message.id
+            scan_row["payload"]["scanned_count"] = scanned_count
+            app.task_store.refresh_payload(
+                scan_row["id"], scan_row["payload"], token=scan_row["claim_token"]
+            )
+            if page_count >= 100 and (not node.limit or scanned_count < node.limit):
+                app.task_store.release(scan_row["id"], scan_row["claim_token"])
+                return
 
     chat_download_config.need_check = True
     chat_download_config.total_task = node.total_task
@@ -603,18 +656,39 @@ async def download_chat_task(
 async def download_all_chat(client: pyrogram.Client):
     """Download All chat"""
     for key, value in app.chat_download_config.items():
-        value.node = TaskNode(chat_id=key)
+        # Stable configured groups deduplicate child tasks across process restarts.
+        group = -int(hashlib.sha256(str(key).encode()).hexdigest()[:14], 16)
+        value.node = TaskNode(chat_id=key, task_id=group)
         try:
+            if app.task_store and any(
+                task["state"] in ("queued", "running", "paused", "retry_wait")
+                for task in app.task_store.list_tasks(group_id=str(group), limit=1000)
+                if task["payload"].get("kind") == "scan"
+            ):
+                continue
             await download_chat_task(client, value, value.node)
         except Exception as e:
             logger.warning(f"Download {key} error: {e}")
         finally:
             value.need_check = True
+    app.initial_scan_done = True
 
 
 async def run_until_all_task_finish():
     """Normal download"""
     while True:
+        if app.task_store:
+            stats = app.task_store.stats()
+            pending = sum(
+                stats[state] for state in ("queued", "running", "retry_wait", "paused")
+            )
+            idle = not app.download_service or not app.download_service.queue.active
+            if (
+                not app.bot_token and app.initial_scan_done and not pending and idle
+            ) or app.restart_program:
+                break
+            await asyncio.sleep(0.2)
+            continue
         finish: bool = True
         for _, value in app.chat_download_config.items():
             if not value.need_check or value.total_task != value.finish_task:
@@ -649,6 +723,12 @@ async def stop_server(client: pyrogram.Client):
 def main():
     """Main function of the downloader."""
     tasks = []
+    producer = None
+    client_started = False
+    bot_started = False
+    app.download_service = None
+    app.task_store = None
+    app.initial_scan_done = False
     client = HookClient(
         "media_downloader",
         api_id=app.api_id,
@@ -660,22 +740,39 @@ def main():
     )
     try:
         app.pre_run()
+        app.task_store = TaskStore(app.task_db_path)
+        app.download_service = DownloadService(
+            app,
+            client,
+            _get_media_meta,
+            _scan_chat_task,
+            _can_download,
+            save_msg_to_file,
+        )
         init_web(app)
 
         set_max_concurrent_transmissions(client, app.max_concurrent_transmissions)
 
         app.loop.run_until_complete(start_server(client))
+        client_started = True
         logger.success(_t("Successfully started (Press Ctrl+C to stop)"))
-
-        app.loop.create_task(download_all_chat(client))
-        for _ in range(app.max_download_task):
-            task = app.loop.create_task(worker(client))
-            tasks.append(task)
 
         if app.bot_token:
             app.loop.run_until_complete(
                 start_download_bot(app, client, add_download_task, download_chat_task)
             )
+            bot_started = True
+        # Build the content index off the event loop before allowing consumers to
+        # skip known media; partial files live outside all scanned media roots.
+        app.loop.run_until_complete(
+            app.download_service.background(app.download_service.index.scan)
+        )
+
+        async def start_consumers():
+            app.download_service.queue.start()
+
+        app.loop.run_until_complete(start_consumers())
+        producer = app.loop.create_task(download_all_chat(client))
         _exec_loop()
     except KeyboardInterrupt:
         logger.info(_t("KeyboardInterrupt"))
@@ -683,9 +780,17 @@ def main():
         logger.exception("{}", e)
     finally:
         app.is_running = False
-        if app.bot_token:
+        if producer:
+            producer.cancel()
+            app.loop.run_until_complete(
+                asyncio.gather(producer, return_exceptions=True)
+            )
+        if app.download_service:
+            app.loop.run_until_complete(app.download_service.queue.stop())
+        if bot_started:
             app.loop.run_until_complete(stop_download_bot())
-        app.loop.run_until_complete(stop_server(client))
+        if client_started:
+            app.loop.run_until_complete(stop_server(client))
         for task in tasks:
             task.cancel()
         logger.info(_t("Stopped!"))

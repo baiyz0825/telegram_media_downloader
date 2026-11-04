@@ -4,7 +4,9 @@ import os
 import platform
 import queue
 import sys
+import tempfile
 import unittest
+from contextlib import ExitStack
 from datetime import datetime
 from typing import List, Union
 
@@ -16,6 +18,7 @@ from media_downloader import (
     _check_config,
     _get_media_meta,
     _is_exist,
+    add_download_task,
     app,
     download_all_chat,
     download_media,
@@ -47,6 +50,7 @@ from .test_common import (
 )
 
 MOCK_DIR: str = "/root/project"
+TEST_DIRECTORY = tempfile.TemporaryDirectory()
 if platform.system() == "Windows":
     MOCK_DIR = "\\root\\project"
 MOCK_CONF = {
@@ -87,8 +91,8 @@ def os_get_file_size(file: str) -> int:
 
 
 def rest_app(conf: dict):
-    config_test = os.path.join(os.path.abspath("."), "config_test.yaml")
-    data_test = os.path.join(os.path.abspath("."), "data_test.yaml")
+    config_test = os.path.join(TEST_DIRECTORY.name, "config_test.yaml")
+    data_test = os.path.join(TEST_DIRECTORY.name, "data_test.yaml")
     if os.path.exists(config_test):
         os.remove(config_test)
     if os.path.exists(data_test):
@@ -116,8 +120,10 @@ def rest_app(conf: dict):
     app.max_concurrent_transmissions: int = 1
     app.web_host: str = "localhost"
     app.web_port: int = 5000
-    app.config_file = "config_test.yaml"
-    app.app_data_file = "data_test.yaml"
+    app.config_file = config_test
+    app.app_data_file = data_test
+    app.task_store = None
+    app.download_service = None
     app.config = conf
     app.assign_config(conf)
     app.assign_app_data(conf)
@@ -355,11 +361,11 @@ def check_for_updates(_: dict = None):
 @mock.patch("media_downloader.fetch_message", new=new_fetch_message)
 @mock.patch("media_downloader.get_chat_history_v2", new=get_chat_history)
 @mock.patch("media_downloader.RETRY_TIME_OUT", new=0)
-@mock.patch("media_downloader.check_for_updates", new=check_for_updates)
 class MediaDownloaderTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.loop = asyncio.get_event_loop()
+        cls.loop = asyncio.new_event_loop()
+        app.loop = cls.loop
         rest_app(MOCK_CONF)
 
     # @mock.patch("media_downloader.app.save_path", new=MOCK_DIR)
@@ -858,6 +864,47 @@ class MediaDownloaderTestCase(unittest.TestCase):
         self.loop.run_until_complete(download_all_chat(client))
         moc_put.assert_called()
 
+    def test_durable_enqueue_does_not_duplicate_group_total(self):
+        rest_app(MOCK_CONF)
+        service = mock.Mock()
+        service.enqueue.return_value = {"id": 1, "state": "queued"}
+        message = MockMessage(id=25)
+        node = TaskNode(chat_id=-123)
+        with mock.patch.object(app, "download_service", service):
+            self.assertTrue(
+                self.loop.run_until_complete(add_download_task(message, node))
+            )
+            self.assertTrue(
+                self.loop.run_until_complete(add_download_task(message, node))
+            )
+        self.assertEqual(node.total_task, 1)
+        self.assertEqual(service.enqueue.call_count, 2)
+
+    def test_existing_nonzero_wrong_size_is_downloaded_again(self):
+        rest_app(MOCK_CONF)
+        reset_download_cache()
+        message = MockMessage(
+            id=314,
+            media=True,
+            video=MockVideo(
+                file_name="truncated.mp4", mime_type="video/mp4", file_size=1024
+            ),
+        )
+        with mock.patch("media_downloader._is_exist", return_value=True), mock.patch(
+            "media_downloader.os.path.getsize", return_value=512
+        ), mock.patch("media_downloader._check_download_finish") as verify, mock.patch(
+            "media_downloader._move_to_download_path"
+        ), mock.patch(
+            "media_downloader.asyncio.sleep", new=mock.AsyncMock()
+        ):
+            status, _ = self.loop.run_until_complete(
+                async_download_media(
+                    MockClient(), message, ["video"], {"video": ["mp4"]}
+                )
+            )
+        self.assertEqual(status, DownloadStatus.SuccessDownload)
+        verify.assert_called_once()
+
     def test_can_download(self):
         file_formats = {
             "audio": ["mp3"],
@@ -995,44 +1042,101 @@ class MediaDownloaderTestCase(unittest.TestCase):
 
         self.assertEqual(res, (DownloadStatus.SkipDownload, None))
 
-    @mock.patch("media_downloader.HookClient", new=MockClient)
-    @mock.patch("media_downloader.RETRY_TIME_OUT", new=1)
-    @mock.patch("media_downloader.logger")
-    def test_main_with_bot(self, mock_logger):
+    def _main_lifecycle(self, startup_error=None, bot=False):
         rest_app(MOCK_CONF)
+        app.bot_token = "test-token" if bot else ""
+        events = []
+        service = mock.Mock()
+        service.queue.start.side_effect = lambda: events.append("workers_start")
+        service.queue.stop = mock.AsyncMock(
+            side_effect=lambda: events.append("workers_stop")
+        )
+        service.background = mock.AsyncMock(
+            side_effect=lambda *_: events.append("index")
+        )
+        with ExitStack() as stack:
+            for target, event in (
+                ("start_server", "client_start"),
+                ("stop_server", "client_stop"),
+                ("start_download_bot", "bot_start"),
+                ("stop_download_bot", "bot_stop"),
+            ):
+                stack.enter_context(
+                    mock.patch(
+                        "media_downloader." + target,
+                        new=mock.AsyncMock(
+                            side_effect=lambda *_, name=event: events.append(name)
+                        ),
+                    )
+                )
+            stack.enter_context(
+                mock.patch("media_downloader.HookClient", new=MockClient)
+            )
+            stack.enter_context(mock.patch("media_downloader.TaskStore"))
+            stack.enter_context(
+                mock.patch("media_downloader.DownloadService", return_value=service)
+            )
+            stack.enter_context(mock.patch("media_downloader.init_web"))
+            stack.enter_context(
+                mock.patch("media_downloader.set_max_concurrent_transmissions")
+            )
+            stack.enter_context(
+                mock.patch("media_downloader.download_all_chat", new=mock.AsyncMock())
+            )
+            stack.enter_context(
+                mock.patch(
+                    "media_downloader._exec_loop",
+                    side_effect=lambda: events.append("wait"),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(app, "pre_run", side_effect=startup_error)
+            )
+            save = stack.enter_context(
+                mock.patch.object(
+                    app,
+                    "update_config",
+                    side_effect=lambda: events.append("config_save"),
+                )
+            )
+            logs = stack.enter_context(mock.patch("media_downloader.logger"))
+            main()
+            save.assert_called_once()
+        app.download_service = None
+        app.task_store = None
+        app.bot_token = ""
+        return events, logs
 
-        main()
-
-        mock_logger.success.assert_called_with(
-            "Updated last read message_id to config file,total download 0, total upload file 0"
+    def test_main_with_bot(self):
+        events, _ = self._main_lifecycle(bot=True)
+        self.assertEqual(
+            events,
+            [
+                "client_start",
+                "bot_start",
+                "index",
+                "workers_start",
+                "wait",
+                "workers_stop",
+                "bot_stop",
+                "client_stop",
+                "config_save",
+            ],
         )
 
-    @mock.patch("media_downloader.app.pre_run", new=raise_keyboard_interrupt)
-    @mock.patch("media_downloader.HookClient", new=MockClient)
-    @mock.patch("media_downloader.RETRY_TIME_OUT", new=1)
-    @mock.patch("media_downloader.logger")
-    def test_keyboard_interrupt(self, mock_logger):
-        rest_app(MOCK_CONF)
+    def test_keyboard_interrupt(self):
+        events, logs = self._main_lifecycle(startup_error=KeyboardInterrupt)
+        logs.info.assert_any_call("KeyboardInterrupt")
+        self.assertNotIn("workers_start", events)
+        self.assertEqual(events[-1], "config_save")
 
-        main()
-
-        mock_logger.info.assert_any_call("KeyboardInterrupt")
-        mock_logger.success.assert_called_with(
-            "Updated last read message_id to config file,total download 0, total upload file 0"
+    def test_other_exception(self):
+        events, logs = self._main_lifecycle(
+            startup_error=RuntimeError("startup failed")
         )
-
-    @mock.patch("media_downloader.app.pre_run", new=raise_exception)
-    @mock.patch("media_downloader.HookClient", new=MockClient)
-    @mock.patch("media_downloader.RETRY_TIME_OUT", new=1)
-    @mock.patch("media_downloader.logger")
-    def test_other_exception(self, mock_logger):
-        rest_app(MOCK_CONF)
-
-        main()
-
-        mock_logger.success.assert_called_with(
-            "Updated last read message_id to config file,total download 0, total upload file 0"
-        )
+        logs.exception.assert_called_once()
+        self.assertNotIn("workers_start", events)
+        self.assertEqual(events[-1], "config_save")
 
     @mock.patch("media_downloader._load_config", new=load_config)
     @mock.patch("media_downloader.logger")
@@ -1094,3 +1198,4 @@ class MediaDownloaderTestCase(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.loop.close()
+        TEST_DIRECTORY.cleanup()

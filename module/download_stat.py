@@ -29,7 +29,18 @@ def get_download_result() -> dict:
 
 def get_total_download_speed() -> int:
     """get total download speed"""
-    return _total_download_speed
+    if get_download_state() == DownloadState.StopDownload:
+        return 0
+    now = time.time()
+    return int(
+        sum(
+            value["download_speed"]
+            for messages in list(_download_result.values())
+            for value in list(messages.values())
+            if value.get("last_seen", value["end_time"]) > now - 3
+            and value["down_byte"] < value["total_size"]
+        )
+    )
 
 
 def get_download_state() -> DownloadState:
@@ -52,6 +63,7 @@ async def update_download_status(
     start_time: float,
     node: TaskNode,
     client: Client,
+    obey_global_pause: bool = True,
 ):
     """update_download_status"""
     cur_time = time.time()
@@ -65,13 +77,18 @@ async def update_download_status(
 
     chat_id = node.chat_id
 
-    while get_download_state() == DownloadState.StopDownload:
+    while obey_global_pause and get_download_state() == DownloadState.StopDownload:
         if node.is_stop_transmission:
             client.stop_transmission()
         await asyncio.sleep(1)
 
     if not _download_result.get(chat_id):
         _download_result[chat_id] = {}
+
+    if _download_result[chat_id].get(message_id):
+        old = _download_result[chat_id][message_id]
+        if old["task_id"] != node.task_id or down_byte < old["down_byte"]:
+            del _download_result[chat_id][message_id]
 
     if _download_result[chat_id].get(message_id):
         last_download_byte = _download_result[chat_id][message_id]["down_byte"]
@@ -95,6 +112,7 @@ async def update_download_status(
         _download_result[chat_id][message_id]["down_byte"] = down_byte
         _download_result[chat_id][message_id]["end_time"] = end_time
         _download_result[chat_id][message_id]["download_speed"] = download_speed
+        _download_result[chat_id][message_id]["last_seen"] = cur_time
         _download_result[chat_id][message_id][
             "each_second_total_download"
         ] = each_second_total_download
@@ -106,11 +124,22 @@ async def update_download_status(
             "file_name": file_name,
             "start_time": start_time,
             "end_time": cur_time,
-            "download_speed": down_byte / (cur_time - start_time),
+            "download_speed": down_byte / max(0.001, cur_time - start_time),
+            "last_seen": cur_time,
             "each_second_total_download": each_second_total_download,
             "task_id": node.task_id,
         }
         _total_download_size += down_byte
+
+    # SQLite owns history. Keep only a bounded legacy in-memory projection.
+    if len(_download_result[chat_id]) > 1000:
+        completed = [
+            key
+            for key, value in list(_download_result[chat_id].items())
+            if value["down_byte"] >= value["total_size"]
+        ]
+        for key in completed[: len(_download_result[chat_id]) - 1000]:
+            _download_result[chat_id].pop(key, None)
 
     if cur_time - _last_download_time >= 1.0:
         # update speed

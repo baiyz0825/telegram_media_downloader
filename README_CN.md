@@ -113,6 +113,18 @@ pip3 install -r requirements.txt
 
 所有配置都通过 config.yaml 文件传递​​给 `Telegram Media Downloader`。
 
+### 持久化队列与恢复
+
+队列任务保存在 `sessions/tasks.db`（SQLite WAL）。Docker 部署请保留 `sessions` 卷；重启后未完成任务会恢复。下载任务和上传任务使用独立消费者，可通过 `max_download_task`、`max_upload_task` 设置并发数。网页和机器人 `/queue` 支持暂停、恢复、取消、重试和置顶插队。
+
+媒体流按 1 MiB 协议块写入临时文件并同步到磁盘。中断后从最后一个完整块续传，文件发布前计算 MD5。`media_directories` 可配置额外媒体目录用于只读 MD5 去重扫描；命中已验证的相同媒体时会复用该文件。Telegram 未提供普通媒体的远端 MD5，因此新文件须完整下载后才能进行内容校验。
+
+`max_retries`、`retry_base_delay`、`request_timeout` 和 `idle_timeout` 控制重试次数、退避时间与网络超时。临时文件位于 `temp/queue`，建议与 `temp` 一起持久化挂载，以便容器重建后续传。
+
+### GHCR 镜像
+
+默认分支收到更新并通过测试后，GitHub Actions 会构建并发布多架构镜像到 `ghcr.io/<仓库所有者>/telegram_media_downloader:latest`。Fork 会使用自身仓库所有者作为镜像仓库；部署时可用 `IMAGE` 环境变量覆盖完整镜像地址。
+
 **获取您的 API 密钥：**
 第一步需要您获得有效的 Telegram API 密钥（API id/hash pair）：
 

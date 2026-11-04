@@ -30,3 +30,8 @@ LICENSE
 dev-requirements.txt
 gen_filter_cache.py
 screenshot/
+*.db
+*.db-wal
+*.db-shm
+bot.yaml
+IMPLEMENTATION_PROGRESS.md

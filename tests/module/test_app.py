@@ -2,6 +2,7 @@
 
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -12,17 +13,9 @@ sys.path.append("..")  # Adds higher directory to python modules path.
 
 
 class AppTestCase(unittest.TestCase):
-    @classmethod
-    def tearDownClass(cls):
-        config_test = os.path.join(os.path.abspath("."), "config_test.yaml")
-        data_test = os.path.join(os.path.abspath("."), "data_test.yaml")
-        if os.path.exists(config_test):
-            os.remove(config_test)
-        if os.path.exists(data_test):
-            os.remove(data_test)
-
     def test_app(self):
         app = Application("", "")
+        self.addCleanup(app.loop.close)
         self.assertEqual(app.save_path, os.path.join(os.path.abspath("."), "downloads"))
         self.assertEqual(app.proxy, {})
         self.assertEqual(app.restart_program, False)
@@ -60,12 +53,34 @@ class AppTestCase(unittest.TestCase):
             app.app_data["chat"][0]["ids_to_retry"],
         )
 
-    @mock.patch("__main__.__builtins__.open", new_callable=mock.mock_open)
-    @mock.patch("module.app.yaml", autospec=True)
-    def test_update_config(self, mock_yaml, mock_open):
+    def test_update_config(self):
         app = Application("", "")
-        app.config_file = "config_test.yaml"
-        app.app_data_file = "data_test.yaml"
-        app.config["chat"] = [{"chat_id": 123, "last_read_message_id": 0}]
-        app.update_config()
-        mock_open.assert_called_with("data_test.yaml", "w", encoding="utf-8")
+        self.addCleanup(app.loop.close)
+        with tempfile.TemporaryDirectory() as directory:
+            app.config_file = os.path.join(directory, "config.yaml")
+            app.app_data_file = os.path.join(directory, "data.yaml")
+            app.config["chat"] = [{"chat_id": 123, "last_read_message_id": 0}]
+            app.chat_download_config[123] = ChatDownloadConfig()
+            app.update_config()
+            with open(app.config_file, encoding="utf-8") as stream:
+                config = module.app._yaml.load(stream)
+            with open(app.app_data_file, encoding="utf-8") as stream:
+                data = module.app._yaml.load(stream)
+            self.assertEqual(config["chat"][0]["chat_id"], 123)
+            self.assertEqual(data["chat"][0]["chat_id"], 123)
+            self.assertEqual(
+                sorted(os.listdir(directory)), ["config.yaml", "data.yaml"]
+            )
+
+    def test_atomic_yaml_failure_keeps_previous_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.yaml")
+            Application._atomic_yaml(path, {"previous": True})
+            with mock.patch(
+                "module.app.os.replace", side_effect=OSError("disk failure")
+            ):
+                with self.assertRaises(OSError):
+                    Application._atomic_yaml(path, {"previous": False})
+            with open(path, encoding="utf-8") as stream:
+                self.assertEqual(module.app._yaml.load(stream), {"previous": True})
+            self.assertEqual(os.listdir(directory), ["config.yaml"])

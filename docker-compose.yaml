@@ -1,8 +1,7 @@
-version: "3.3"
-
 services:
   telegram_media_downloader:
-    image: tangyoha/telegram_media_downloader:latest
+    # Override IMAGE when deploying a fork's GHCR package.
+    image: ${IMAGE:-ghcr.io/${GITHUB_REPOSITORY_OWNER:-baiyz0825}/telegram_media_downloader:latest}
     build: .
     ports:
       # Here is what you need to edit
@@ -23,7 +22,7 @@ services:
       - "./log/:/app/log/"
       - "./sessions/:/app/sessions"
       - "./temp/:/app/temp"
-    #restart: "unless-stopped"
+    restart: unless-stopped
 # volumes:
 #   sessions:
 #   temp:

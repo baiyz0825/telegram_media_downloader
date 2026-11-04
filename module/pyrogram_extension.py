@@ -302,7 +302,7 @@ async def upload_telegram_chat(
             download_status is DownloadStatus.SkipDownload and not message.media
         ):
             try:
-                await upload_telegram_chat_message(
+                status = await upload_telegram_chat_message(
                     client,
                     upload_user,
                     app,
@@ -312,8 +312,12 @@ async def upload_telegram_chat(
                 )
             except Exception as e:
                 logger.exception(f"Upload file {file_name} error: {e}")
-            finally:
-                if file_name and app.after_upload_telegram_delete:
+            else:
+                if (
+                    status == ForwardStatus.SuccessForward
+                    and file_name
+                    and app.after_upload_telegram_delete
+                ):
                     os.remove(file_name)
 
             # forward text
@@ -395,7 +399,7 @@ async def _upload_signal_message(
             # TODO(tangyoha): add more log when upload video more than 2000MB failed
             # Send video to the destination chat
             if node.reply_to_message:
-                await node.reply_to_message.reply_video(
+                return await node.reply_to_message.reply_video(
                     file_name,
                     caption=caption,
                     message_thread_id=node.topic_id,
@@ -406,7 +410,7 @@ async def _upload_signal_message(
                     parse_mode=pyrogram.enums.ParseMode.HTML,
                 )
             else:
-                await upload_user.send_video(
+                return await upload_user.send_video(
                     upload_telegram_chat_id,
                     file_name,
                     thumb=thumbnail_file,
@@ -433,13 +437,13 @@ async def _upload_signal_message(
 
     elif message.photo:
         if node.reply_to_message:
-            await node.reply_to_message.reply_photo(
+            return await node.reply_to_message.reply_photo(
                 file_name,
                 caption=caption,
                 message_thread_id=node.topic_id,
             )
         else:
-            await upload_user.send_photo(
+            return await upload_user.send_photo(
                 upload_telegram_chat_id,
                 file_name,
                 caption=caption,
@@ -455,13 +459,13 @@ async def _upload_signal_message(
             )
     elif message.document:
         if node.reply_to_message:
-            await node.reply_to_message.reply_document(
+            return await node.reply_to_message.reply_document(
                 file_name,
                 caption=caption,
                 message_thread_id=node.topic_id,
             )
         else:
-            await upload_user.send_document(
+            return await upload_user.send_document(
                 upload_telegram_chat_id,
                 file_name,
                 caption=caption,
@@ -475,15 +479,33 @@ async def _upload_signal_message(
                 ),
                 message_thread_id=node.topic_id,
             )
+    elif message.audio:
+        if node.reply_to_message:
+            return await node.reply_to_message.reply_audio(
+                file_name,
+                caption=caption,
+                message_thread_id=node.topic_id,
+            )
+        return await upload_user.send_audio(
+            upload_telegram_chat_id,
+            file_name,
+            caption=caption,
+            duration=getattr(message.audio, "duration", 0),
+            performer=getattr(message.audio, "performer", None),
+            title=getattr(message.audio, "title", None),
+            progress=update_upload_stat,
+            progress_args=(message.id, ui_file_name, time.time(), node, upload_user),
+            message_thread_id=node.topic_id,
+        )
     elif message.voice:
         if node.reply_to_message:
-            await node.reply_to_message.reply_voice(
+            return await node.reply_to_message.reply_voice(
                 file_name,
                 caption=caption,
                 message_thread_id=node.topic_id,
             )
         else:
-            await upload_user.send_voice(
+            return await upload_user.send_voice(
                 upload_telegram_chat_id,
                 file_name,
                 caption=caption,
@@ -499,13 +521,13 @@ async def _upload_signal_message(
             )
     elif message.video_note:
         if node.reply_to_message:
-            await node.reply_to_message.reply_video_note(
+            return await node.reply_to_message.reply_video_note(
                 file_name,
                 caption=caption,
                 message_thread_id=node.topic_id,
             )
         else:
-            await upload_user.send_video_note(
+            return await upload_user.send_video_note(
                 upload_telegram_chat_id,
                 file_name,
                 caption=caption,
@@ -521,15 +543,17 @@ async def _upload_signal_message(
             )
     elif message.text:
         if node.reply_to_message:
-            await node.reply_to_message.reply(
+            return await node.reply_to_message.reply(
                 message.text if text is None else text, message_thread_id=node.topic_id
             )
         else:
-            await upload_user.send_message(
+            return await upload_user.send_message(
                 upload_telegram_chat_id,
                 message.text if text is None else text,
                 message_thread_id=node.topic_id,
             )
+    else:
+        raise ValueError("Unsupported Telegram upload media type")
 
 
 def truncate_caption(
@@ -653,7 +677,9 @@ async def process_caption(
     return truncated_caption
 
 
-def convert_message_entity(client, entity: "pyrogram.raw.base.MessageEntity") -> Optional["pyrogram.types.MessageEntity"]:
+def convert_message_entity(
+    client, entity: "pyrogram.raw.base.MessageEntity"
+) -> Optional["pyrogram.types.MessageEntity"]:
     # Special case for InputMessageEntityMentionName -> MessageEntityType.TEXT_MENTION
     # This happens in case of UpdateShortSentMessage inside send_message() where entities are parsed from the input
     if isinstance(entity, pyrogram.raw.types.InputMessageEntityMentionName):
@@ -672,8 +698,9 @@ def convert_message_entity(client, entity: "pyrogram.raw.base.MessageEntity") ->
         language=getattr(entity, "language", None),
         custom_emoji_id=getattr(entity, "document_id", None),
         expandable=getattr(entity, "collapsed", None),
-        client=client
+        client=client,
     )
+
 
 def convert_entities(
     entities: List[pyrogram.raw.base.MessageEntity],
@@ -683,9 +710,7 @@ def convert_entities(
         return []
 
     try:
-        return [
-            convert_message_entity(None, entity) for entity in entities
-        ]
+        return [convert_message_entity(None, entity) for entity in entities]
     except Exception as e:
         logger.warning(f"Failed to convert entities: {e}")
         return []
@@ -996,11 +1021,15 @@ def record_download_status(func):
 
         _download_cache[(node.chat_id, message.id)] = DownloadStatus.Downloading
 
-        status, file_name = await func(client, message, media_types, file_formats, node)
-
-        _download_cache[(node.chat_id, message.id)] = status
-
-        return status, file_name
+        try:
+            status, file_name = await func(
+                client, message, media_types, file_formats, node
+            )
+            _download_cache[(node.chat_id, message.id)] = status
+            return status, file_name
+        except BaseException:
+            _download_cache.pop((node.chat_id, message.id), None)
+            raise
 
     return inner
 
@@ -1054,7 +1083,10 @@ async def report_bot_status(
 ):
     """see _report_bot_status"""
     try:
-        return await _report_bot_status(client, node, immediate_reply)
+        from module.language import use_language
+
+        with use_language(getattr(node, "language", None)):
+            return await _report_bot_status(client, node, immediate_reply)
     except Exception as e:
         logger.debug(f"{e}")
 
@@ -1079,6 +1111,16 @@ async def _report_bot_status(
         return
 
     if immediate_reply or node.can_reply():
+        if node.task_store:
+            summary = node.task_store.group_summary(node.task_id)
+            node.total_task = summary["total"]
+            node.total_download_task = summary["finished"]
+            node.skip_download_task = summary["skipped"]
+            node.success_download_task = (
+                summary["counts"]["completed"] - summary["skipped"]
+            )
+            node.failed_download_task = summary["counts"]["failed"]
+            node.total_download_byte = summary["bytes"]
         if node.upload_telegram_chat_id:
             node.forward_msg_detail_str = (
                 f"\n🔄 {_t('Forward')}\n"
@@ -1096,7 +1138,7 @@ async def _report_bot_status(
                 f"└─ ✅ {_t('Success')}: {node.upload_success_count}\n"
             )
 
-        for idx, value in node.cloud_drive_upload_stat_dict.items():
+        for idx, value in list(node.cloud_drive_upload_stat_dict.items())[:3]:
             if value.transferred == value.total:
                 continue
 
@@ -1115,7 +1157,8 @@ async def _report_bot_status(
         download_result = get_download_result()
         if node.chat_id in download_result:
             messages = download_result[node.chat_id]
-            for idx, value in messages.items():
+            shown = 0
+            for idx, value in list(messages.items()):
                 task_id = value["task_id"]
                 if task_id != node.task_id or value["down_byte"] == value["total_size"]:
                     continue
@@ -1123,7 +1166,11 @@ async def _report_bot_status(
                 temp_file_name = truncate_filename(
                     os.path.basename(value["file_name"]), 10
                 )
-                progress = int(value["down_byte"] / value["total_size"] * 100)
+                if shown >= 3:
+                    download_result_str += "另有文件正在处理，使用 /queue 查看。\n"
+                    break
+                shown += 1
+                progress = int(value["down_byte"] / max(1, value["total_size"]) * 100)
                 download_result_str += (
                     f" ├─ 🆔 {_t('Message ID')}: {idx}\n"
                     f" │   ├─ 📁 : {temp_file_name}\n"
@@ -1139,12 +1186,12 @@ async def _report_bot_status(
                 )
 
         upload_result_str = ""
-        for idx, value in node.upload_stat_dict.items():
+        for idx, value in list(node.upload_stat_dict.items())[:3]:
             if value.total_size == value.upload_size:
                 continue
 
             temp_file_name = truncate_filename(os.path.basename(value.file_name), 10)
-            progress = int(value.upload_size / value.total_size * 100)
+            progress = int(value.upload_size / max(1, value.total_size) * 100)
             upload_result_str += (
                 f" ├─ 🆔 {_t('Message ID')}: {idx}\n"
                 f" │   ├─ 📁 : {temp_file_name}\n"
@@ -1161,7 +1208,7 @@ async def _report_bot_status(
             f"`\n"
             f"🆔 task id: {node.task_id}\n"
             f"📥 {_t('Downloading')}: {format_byte(node.total_download_byte)}\n"
-            f"├─ 📁 {_t('Total')}: {node.total_download_task}\n"
+            f"├─ 📁 {_t('Total')}: {node.total_download_task}/{node.total_task}\n"
             f"├─ ✅ {_t('Success')}: {node.success_download_task}\n"
             f"├─ ❌ {_t('Failed')}: {node.failed_download_task}\n"
             f"└─ ⏩ {_t('Skipped')}: {node.skip_download_task}\n"
@@ -1172,13 +1219,13 @@ async def _report_bot_status(
         )
 
         if new_msg_str != node.last_edit_msg:
-            node.last_edit_msg = new_msg_str
             await client.edit_message_text(
-                node.from_user_id,
+                getattr(node, "reply_chat_id", None) or node.from_user_id,
                 node.reply_message_id,
-                new_msg_str,
-                parse_mode=pyrogram.enums.ParseMode.MARKDOWN,
+                new_msg_str.strip("`\n")[:3900],
+                parse_mode=pyrogram.enums.ParseMode.DISABLED,
             )
+            node.last_edit_msg = new_msg_str
 
 
 def set_max_concurrent_transmissions(

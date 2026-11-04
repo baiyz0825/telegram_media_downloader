@@ -2,7 +2,11 @@
 
 import asyncio
 import os
+import tempfile
+import time
 from datetime import datetime
+from functools import wraps
+from math import ceil
 from typing import Callable, List, Union
 
 import pyrogram
@@ -25,7 +29,7 @@ from module.app import (
 )
 from module.filter import Filter
 from module.get_chat_history_v2 import get_chat_history_v2
-from module.language import Language, _t
+from module.language import Language, _t, get_language, use_language
 from module.pyrogram_extension import (
     check_user_permission,
     get_utf16_length,
@@ -41,6 +45,40 @@ from utils.format import replace_date_time, validate_title
 from utils.meta_data import MetaData
 
 # pylint: disable = C0301, R0902
+
+
+COMMAND_DEFINITIONS = (
+    ("help", "Help"),
+    ("get_info", "Get group and user info from message link"),
+    ("download", "Download messages"),
+    ("forward", "Forward messages"),
+    ("listen_forward", "Listen for forwarded messages"),
+    ("forward_to_comments", "Forward a specific media to a comment section"),
+    ("add_filter", "Add download filter"),
+    ("set_language", "Set language"),
+    ("stop", "Stop bot download or forward"),
+    ("queue", "Manage persistent download queue"),
+)
+
+
+def build_bot_commands():
+    """Build menus and help from the same translated command registry."""
+    return [
+        types.BotCommand(command, _t(description))
+        for command, description in COMMAND_DEFINITIONS
+    ]
+
+
+def localized_handler(callback):
+    """Scope message/callback translations to the submitting user's preference."""
+
+    @wraps(callback)
+    async def inner(client, update):
+        user_id = getattr(getattr(update, "from_user", None), "id", None)
+        with use_language(_bot.user_language(user_id)):
+            return await callback(client, update)
+
+    return inner
 
 
 class DownloadBot:
@@ -70,11 +108,86 @@ class DownloadBot:
         self.download_filter: List[str] = []
         self.task_id: int = 0
         self.reply_task = None
+        self.user_download_filters: dict = {}
+        self.user_languages: dict = {}
+        self.listen_forward_configs: dict = {}
+        self.admin_id = None
 
     def gen_task_id(self) -> int:
-        """Gen task id"""
-        self.task_id += 1
+        """Generate restart-safe group IDs rather than reusing small counters."""
+        self.task_id = max(self.task_id + 1, time.time_ns())
         return self.task_id
+
+    def user_language(self, user_id) -> Language:
+        """Read a user's preference without changing the process-wide default."""
+        name = self.user_languages.get(str(user_id))
+        return Language.__members__.get(
+            str(name).upper(), getattr(self.app, "language", Language.EN)
+        )
+
+    def save_listener(self, node: TaskNode, cursor=None, enabled=True):
+        """Atomically persist a subscription after its messages enter SQLite.
+
+        An interrupted save may replay messages, but enqueue keys make replay
+        harmless. Advancing a cursor before enqueue would permanently lose work.
+        """
+        from module.durable_queue import node_payload
+
+        key = str(node.chat_id)
+        previous = self.listen_forward_configs.get(key)
+        payload = node_payload(node)
+        payload["use_bot_upload"] = node.upload_user is self.bot
+        record = {
+            "enabled": enabled,
+            "cursor_initialized": True,
+            "last_message_id": int(
+                cursor
+                if cursor is not None
+                else (previous or {}).get("last_message_id", 0)
+            ),
+            "payload": payload,
+        }
+        self.listen_forward_configs[key] = record
+        try:
+            self.update_config()
+        except Exception:
+            if previous is None:
+                self.listen_forward_configs.pop(key, None)
+            else:
+                self.listen_forward_configs[key] = previous
+            raise
+        node.last_message_id = record["last_message_id"]
+
+    def restore_listeners(self):
+        """Recreate enabled listeners using runtime clients, never serialized clients."""
+        service = getattr(self.app, "download_service", None)
+        if service is None:
+            return
+        for record in self.listen_forward_configs.values():
+            if not record.get("enabled", True):
+                continue
+            try:
+                payload = record["payload"]
+                owner = payload.get("from_user_id")
+                if owner not in self.allowed_user_ids:
+                    logger.warning(
+                        "Skipping listener whose owner is no longer allowed: {}", owner
+                    )
+                    continue
+                node = service.restore_node(payload)
+                node.upload_user = (
+                    self.bot if payload.get("use_bot_upload") else self.client
+                )
+                node.upload_as_bot = bool(payload.get("use_bot_upload"))
+                node.last_message_id = int(record.get("last_message_id", 0))
+                node.is_running = True
+                self.listen_forward_chat[node.chat_id] = node
+                self.add_task_node(node)
+            except Exception as error:
+                # Preserve invalid/unreachable subscriptions for diagnosis and retry.
+                logger.warning("Unable to restore listener: {}", error)
+        if self.listen_forward_chat and self.monitor_task is None:
+            self.monitor_task = self.app.loop.create_task(start_message_monitor())
 
     def add_task_node(self, node: TaskNode):
         """Add task node"""
@@ -82,27 +195,52 @@ class DownloadBot:
 
     def remove_task_node(self, task_id: int):
         """Remove task node"""
-        self.task_node.pop(task_id)
+        self.task_node.pop(task_id, None)
 
-    def stop_task(self, task_id: str):
-        """Stop task"""
-        if task_id == "all":
-            for value in self.task_node.values():
-                value.stop_transmission()
-        else:
-            try:
-                task = self.task_node.get(int(task_id))
-                if task:
-                    task.stop_transmission()
-            except Exception:
-                return
+    def stop_task(
+        self, task_id: str, task_type=None, owner_id=None, cancel_persisted=True
+    ):
+        """Stop only the selected task type and owner; shutdown may omit both."""
+        for key, value in self.task_node.copy().items():
+            if task_id != "all" and str(key) != str(task_id):
+                continue
+            if task_type is not None and value.task_type is not task_type:
+                continue
+            if owner_id is not None and value.from_user_id != owner_id:
+                continue
+            if (
+                cancel_persisted
+                and value.task_type is TaskType.ListenForward
+                and getattr(self.app, "download_service", None) is not None
+            ):
+                # Persist disabled before stopping, so a restart cannot revive it.
+                self.save_listener(value, enabled=False)
+            value.stop_transmission()
+            store = getattr(self.app, "task_store", None)
+            if store is not None and cancel_persisted:
+                # The database is authoritative: queued children must be cancelled too.
+                offset = 0
+                while True:
+                    rows = store.list_tasks(group_id=str(key), limit=100, offset=offset)
+                    for row in rows:
+                        if row["state"] not in ("completed", "cancelled", "failed"):
+                            store.cancel(row["id"])
+                    if len(rows) < 100:
+                        break
+                    offset += len(rows)
 
     async def update_reply_message(self):
         """Update reply message"""
         while self.is_running:
             for key, value in self.task_node.copy().items():
                 if value.is_running:
-                    await report_bot_status(self.bot, value)
+                    try:
+                        await report_bot_status(self.bot, value)
+                    except pyrogram.errors.FloodWait as error:
+                        await asyncio.sleep(error.value)
+                    except Exception as error:
+                        # One unavailable reply target must not stop all task updates.
+                        logger.warning("Unable to update bot task {}: {}", key, error)
 
             for key, value in self.task_node.copy().items():
                 if value.is_running and value.is_finish():
@@ -123,15 +261,33 @@ class DownloadBot:
         """
 
         self.download_filter = _config.get("download_filter", self.download_filter)
+        self.user_download_filters = _config.get("user_download_filters", {})
+        self.user_languages = _config.get("user_languages", {})
+        self.listen_forward_configs = _config.get("listen_forward_configs", {})
 
         return True
 
     def update_config(self):
         """Update config from str."""
         self.config["download_filter"] = self.download_filter
-
-        with open("d", "w", encoding="utf-8") as yaml_file:
-            self._yaml.dump(self.config, yaml_file)
+        self.config["user_download_filters"] = self.user_download_filters
+        self.config["user_languages"] = self.user_languages
+        self.config["listen_forward_configs"] = self.listen_forward_configs
+        directory = os.path.dirname(os.path.abspath(self.config_path))
+        os.makedirs(directory, exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=directory, delete=False
+            ) as yaml_file:
+                temporary_path = yaml_file.name
+                self._yaml.dump(self.config, yaml_file)
+                yaml_file.flush()
+                os.fsync(yaml_file.fileno())
+            os.replace(temporary_path, self.config_path)
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
 
     async def start(
         self,
@@ -149,38 +305,6 @@ class DownloadBot:
             workdir=app.session_file_path,
             proxy=app.proxy,
         )
-
-        # Command list
-        commands = [
-            types.BotCommand("help", _t("Help")),
-            types.BotCommand(
-                "get_info", _t("Get group and user info from message link")
-            ),
-            types.BotCommand(
-                "download",
-                _t(
-                    "To download the video, use the method to directly enter /download to view"
-                ),
-            ),
-            types.BotCommand(
-                "forward",
-                _t("Forward video, use the method to directly enter /forward to view"),
-            ),
-            types.BotCommand(
-                "listen_forward",
-                _t(
-                    "Listen forward, use the method to directly enter /listen_forward to view"
-                ),
-            ),
-            types.BotCommand(
-                "add_filter",
-                _t(
-                    "Add download filter, use the method to directly enter /add_filter to view"
-                ),
-            ),
-            types.BotCommand("set_language", _t("Set language")),
-            types.BotCommand("stop", _t("Stop bot download or forward")),
-        ]
 
         self.app = app
         self.client = client
@@ -207,76 +331,78 @@ class DownloadBot:
                 logger.warning(f"set allowed_user_ids error: {e}")
 
         admin = await self.client.get_me()
+        self.admin_id = admin.id
         self.allowed_user_ids.append(admin.id)
+        self.restore_listeners()
 
-        await self.bot.set_bot_commands(commands)
+        await self.bot.set_bot_commands(build_bot_commands())
 
         self.bot.add_handler(
             MessageHandler(
-                download_from_bot,
+                localized_handler(download_from_bot),
                 filters=pyrogram.filters.command(["download"])
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
         self.bot.add_handler(
             MessageHandler(
-                forward_messages,
+                localized_handler(forward_messages),
                 filters=pyrogram.filters.command(["forward"])
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
         self.bot.add_handler(
             MessageHandler(
-                download_forward_media,
+                localized_handler(download_forward_media),
                 filters=pyrogram.filters.media
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
         self.bot.add_handler(
             MessageHandler(
-                download_from_link,
+                localized_handler(download_from_link),
                 filters=pyrogram.filters.regex(r"^https://t.me.*")
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
         self.bot.add_handler(
             MessageHandler(
-                set_listen_forward_msg,
+                localized_handler(set_listen_forward_msg),
                 filters=pyrogram.filters.command(["listen_forward"])
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
         self.bot.add_handler(
             MessageHandler(
-                help_command,
+                localized_handler(help_command),
                 filters=pyrogram.filters.command(["help"])
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
         self.bot.add_handler(
             MessageHandler(
-                get_info,
+                localized_handler(get_info),
                 filters=pyrogram.filters.command(["get_info"])
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
         self.bot.add_handler(
             MessageHandler(
-                help_command,
+                localized_handler(help_command),
                 filters=pyrogram.filters.command(["start"])
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
         self.bot.add_handler(
             MessageHandler(
-                set_language,
+                localized_handler(set_language),
                 filters=pyrogram.filters.command(["set_language"])
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
         self.bot.add_handler(
             MessageHandler(
-                add_filter,
+                localized_handler(add_filter),
                 filters=pyrogram.filters.command(["add_filter"])
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
@@ -284,15 +410,23 @@ class DownloadBot:
 
         self.bot.add_handler(
             MessageHandler(
-                stop,
+                localized_handler(stop),
                 filters=pyrogram.filters.command(["stop"])
+                & pyrogram.filters.user(self.allowed_user_ids),
+            )
+        )
+        self.bot.add_handler(
+            MessageHandler(
+                localized_handler(queue_command),
+                filters=pyrogram.filters.command(["queue"])
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
         )
 
         self.bot.add_handler(
             CallbackQueryHandler(
-                on_query_handler, filters=pyrogram.filters.user(self.allowed_user_ids)
+                localized_handler(on_query_handler),
+                filters=pyrogram.filters.user(self.allowed_user_ids),
             )
         )
 
@@ -305,7 +439,7 @@ class DownloadBot:
 
         self.bot.add_handler(
             MessageHandler(
-                forward_to_comments,
+                localized_handler(forward_to_comments),
                 filters=pyrogram.filters.command(["forward_to_comments"])
                 & pyrogram.filters.user(self.allowed_user_ids),
             )
@@ -331,7 +465,8 @@ async def stop_download_bot():
     _bot.is_running = False
     if _bot.reply_task:
         _bot.reply_task.cancel()
-    _bot.stop_task("all")
+    # Shutdown interrupts transfers but must preserve queued work for restart.
+    _bot.stop_task("all", cancel_persisted=False)
     if _bot.bot:
         await _bot.bot.stop()
     if _bot.monitor_task:
@@ -380,19 +515,16 @@ async def send_help_str(client: pyrogram.Client, chat_id):
     # except Exception:
     #     latest_release_str = ""
 
+    command_help = "\n".join(
+        f"/{command} - {_t(description)}"
+        for command, description in COMMAND_DEFINITIONS
+    )
     msg = (
         f"`\n🤖 {_t('Telegram Media Downloader')}\n"
         f"🌐 {_t('Version')}: {utils.__version__}`\n"
         f"{latest_release_str}\n"
         f"{_t('Available commands:')}\n"
-        f"/help - {_t('Show available commands')}\n"
-        f"/get_info - {_t('Get group and user info from message link')}\n"
-        f"/download - {_t('Download messages')}\n"
-        f"/forward - {_t('Forward messages')}\n"
-        f"/listen_forward - {_t('Listen for forwarded messages')}\n"
-        f"/forward_to_comments - {_t('Forward a specific media to a comment section')}\n"
-        f"/set_language - {_t('Set language')}\n"
-        f"/stop - {_t('Stop bot download or forward')}\n\n"
+        f"{command_help}\n\n"
         # f"/add_replace_ad - {_t('Add replace advertisement filter')}\n"
         # f"/remove_replace_ad - {_t('Remove replace advertisement filter')}\n"
         # f"/add_filter_ad - {_t('Add filter advertisement filter')}\n"
@@ -433,7 +565,7 @@ async def set_language(client: pyrogram.Client, message: pyrogram.types.Message)
         None
     """
 
-    if len(message.text.split()) != 2:
+    if len((message.text or "").split()) != 2:
         await client.send_message(
             message.from_user.id,
             _t("Invalid command format. Please use /set_language en/ru/zh/ua"),
@@ -444,10 +576,23 @@ async def set_language(client: pyrogram.Client, message: pyrogram.types.Message)
 
     try:
         language = Language[language.upper()]
-        _bot.app.set_language(language)
-        await client.send_message(
-            message.from_user.id, f"{_t('Language set to')} {language.name}"
-        )
+        _bot.user_languages[str(message.from_user.id)] = language.name
+        _bot.update_config()
+        # Chat scope keeps one user's menu preference away from other users.
+        # In groups a member scope avoids changing the whole group's menu.
+        scope = types.BotCommandScopeChat(message.chat.id)
+        if message.chat.id != message.from_user.id:
+            scope = types.BotCommandScopeChatMember(
+                message.chat.id, message.from_user.id
+            )
+        with use_language(language):
+            try:
+                await client.set_bot_commands(build_bot_commands(), scope=scope)
+            except Exception as error:
+                logger.warning("Language saved, menu update failed: {}", error)
+            await client.send_message(
+                message.chat.id, f"{_t('Language set to')} {language.name}"
+            )
     except KeyError:
         await client.send_message(
             message.from_user.id,
@@ -528,9 +673,11 @@ async def add_filter(client: pyrogram.Client, message: pyrogram.types.Message):
     filter_str = replace_date_time(args[1])
     res, err = _bot.filter.check_filter(filter_str)
     if res:
-        _bot.app.down = args[1]
+        _bot.user_download_filters[str(message.from_user.id)] = args[1]
+        _bot.update_config()
         await client.send_message(
-            message.from_user.id, f"{_t('Add download filter')} : {args[1]}"
+            message.chat.id,
+            f"{_t('Add download filter')} : {args[1]}\n仅用于你之后提交的下载任务。",
         )
     else:
         await client.send_message(
@@ -809,9 +956,17 @@ async def direct_download(
 ):
     """Direct Download"""
 
-    replay_message = "Direct download..."
+    default_filter = download_bot.user_download_filters.get(str(message.from_user.id))
+    if default_filter:
+        metadata = MetaData()
+        set_meta_data(metadata, download_message)
+        download_bot.filter.set_meta_data(metadata)
+        if not download_bot.filter.exec(replace_date_time(default_filter)):
+            await download_bot.bot.send_message(message.chat.id, "此消息不符合你的默认过滤器，已跳过。")
+            return
+    replay_message = "已接收下载任务，正在加入持久化队列。使用 /queue 查看或调整任务。"
     last_reply_message = await download_bot.bot.send_message(
-        message.from_user.id, replay_message, reply_to_message_id=message.id
+        message.chat.id, replay_message, reply_to_message_id=message.id
     )
 
     node = TaskNode(
@@ -824,6 +979,8 @@ async def direct_download(
         task_id=_bot.gen_task_id(),
     )
 
+    node.reply_chat_id = message.chat.id
+    node.language = get_language().name
     node.client = client
 
     _bot.add_task_node(node)
@@ -886,6 +1043,7 @@ async def download_from_link(client: pyrogram.Client, message: pyrogram.types.Me
         await client.send_message(
             message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
         )
+        return
 
     chat_id, message_id, _ = await parse_link(_bot.client, text[0])
 
@@ -900,7 +1058,7 @@ async def download_from_link(client: pyrogram.Client, message: pyrogram.types.Me
             if download_message:
                 await direct_download(_bot, entity.id, message, download_message)
             else:
-                client.send_message(
+                await client.send_message(
                     message.from_user.id,
                     f"{_t('From')} {entity.title} {_t('download')} {message_id} {_t('error')}!",
                     reply_to_message_id=message.id,
@@ -928,7 +1086,7 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
         f"<i>/download https://t.me/12000000 N M [filter]</i>\n\n"
     )
 
-    args = message.text.split(maxsplit=4)
+    args = (message.text or "").split(maxsplit=4)
     if not message.text or len(args) < 4:
         await client.send_message(
             message.from_user.id, msg, parse_mode=pyrogram.enums.ParseMode.HTML
@@ -945,16 +1103,22 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
         )
         return
 
+    if (
+        start_offset_id < 1
+        or end_offset_id < 0
+        or (end_offset_id and end_offset_id < start_offset_id)
+    ):
+        await client.send_message(message.chat.id, "消息范围无效：起点必须 ≥ 1，终点为 0 或 ≥ 起点。")
+        return
     limit = 0
     if end_offset_id:
-        if end_offset_id < start_offset_id:
-            raise ValueError(
-                f"end_offset_id < start_offset_id, {end_offset_id} < {start_offset_id}"
-            )
-
         limit = end_offset_id - start_offset_id + 1
 
-    download_filter = args[4] if len(args) > 4 else None
+    download_filter = (
+        args[4]
+        if len(args) > 4
+        else _bot.user_download_filters.get(str(message.from_user.id))
+    )
 
     if download_filter:
         download_filter = replace_date_time(download_filter)
@@ -965,20 +1129,21 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
             )
             return
     try:
+        entity = None
         chat_id, _, _ = await parse_link(_bot.client, url)
         if chat_id:
             entity = await _bot.client.get_chat(chat_id)
         if entity:
             chat_title = entity.title
-            reply_message = f"from {chat_title} "
+            reply_message = f"已接收任务 · 来源：{chat_title}\n"
             chat_download_config = ChatDownloadConfig()
             chat_download_config.last_read_message_id = start_offset_id
             chat_download_config.download_filter = download_filter
             reply_message += (
-                f"download message id = {start_offset_id} - {end_offset_id} !"
+                f"消息范围：{start_offset_id}—{end_offset_id or '最新'}\n使用 /queue 查看和控制任务。"
             )
             last_reply_message = await client.send_message(
-                message.from_user.id, reply_message, reply_to_message_id=message.id
+                message.chat.id, reply_message, reply_to_message_id=message.id
             )
             node = TaskNode(
                 chat_id=entity.id,
@@ -991,9 +1156,19 @@ async def download_from_bot(client: pyrogram.Client, message: pyrogram.types.Mes
                 bot=_bot.bot,
                 task_id=_bot.gen_task_id(),
             )
+            node.reply_chat_id = message.chat.id
+            node.language = get_language().name
             _bot.add_task_node(node)
-            _bot.app.loop.create_task(
-                _bot.download_chat_task(_bot.client, chat_download_config, node)
+            if getattr(_bot.app, "download_service", None) is not None:
+                # Acknowledge completion of submission only after the scan is durable.
+                await _bot.download_chat_task(_bot.client, chat_download_config, node)
+            else:
+                _bot.app.loop.create_task(
+                    _bot.download_chat_task(_bot.client, chat_download_config, node)
+                )
+        else:
+            await client.send_message(
+                message.chat.id, "无法识别来源，请提供有效的 Telegram 群组或频道链接。"
             )
     except Exception as e:
         await client.send_message(
@@ -1073,7 +1248,7 @@ async def get_forward_task_node(
             )
 
     last_reply_message = await client.send_message(
-        message.from_user.id,
+        message.chat.id,
         "Forwarding message, please wait...",
         reply_to_message_id=message.id,
     )
@@ -1095,6 +1270,8 @@ async def get_forward_task_node(
         topic_id=topic_id,
     )
 
+    node.reply_chat_id = message.chat.id
+    node.language = get_language().name
     if target_msg_id and reply_comment:
         node.reply_to_message = await _bot.client.get_discussion_message(
             dst_chat_id, target_msg_id
@@ -1115,6 +1292,8 @@ async def get_forward_task_node(
             "Note that the robot may not be in the target group,"
             " use the user account to forward",
         )
+
+    node.upload_as_bot = node.upload_user is _bot.bot
 
     return node
 
@@ -1170,7 +1349,9 @@ async def forward_message_impl(
     if not node:
         return
 
-    if not node.has_protected_content:
+    if getattr(_bot.app, "download_service", None) is not None:
+        await forward_msg(node, offset_id)
+    elif not node.has_protected_content:
         try:
             async for item in get_chat_history_v2(  # type: ignore
                 _bot.client,
@@ -1274,20 +1455,33 @@ async def check_new_messages(
         last_message_id (int): The ID of the last processed message
     """
     try:
+        durable = getattr(_bot.app, "download_service", None) is not None
         # Only get the most recent message if last_message_id is 0
-        if last_message_id == 0:
+        initialized = durable and _bot.listen_forward_configs.get(str(chat_id), {}).get(
+            "cursor_initialized", False
+        )
+        if last_message_id == 0 and not initialized:
             async for message in get_chat_history_v2(  # type: ignore
                 client, chat_id, limit=1  # Get only the latest message
             ):
-                last_message_id = message.id
-                return last_message_id
+                if durable:
+                    _bot.save_listener(node, cursor=message.id)
+                return message.id
 
         # Otherwise check for new messages after last_message_id
         async for message in get_chat_history_v2(  # type: ignore
             client, chat_id, limit=100, offset_id=last_message_id, reverse=True
         ):
+            if node.is_stop_transmission or not node.is_running:
+                break
             if message.id > last_message_id:
-                if not node.has_protected_content:
+                if durable:
+                    # Commit each message before its cursor: replay is safe, loss is not.
+                    accepted = await _bot.add_download_task(message, node)
+                    if not accepted:
+                        raise RuntimeError("Unable to persist listener message")
+                    _bot.save_listener(node, cursor=message.id)
+                elif not node.has_protected_content:
                     await forward_normal_content(client, node, message)
                     await report_bot_status(client, node, immediate_reply=True)
                 else:
@@ -1304,18 +1498,26 @@ async def start_message_monitor():
     Starts monitoring all chats that need to be forwarded.
     Runs every 60 seconds to check for new messages.
     """
-    last_message_ids = {}  # 存储每个聊天的最后处理的消息ID
+    last_message_ids = (
+        {}
+    )  # Legacy mode; durable subscriptions keep their cursor in YAML.
 
     while _bot.is_running:
         try:
-            for chat_id, node in _bot.listen_forward_chat.items():
-                if not node.is_running:
+            for chat_id, node in list(_bot.listen_forward_chat.items()):
+                if not node.is_running or node.is_stop_transmission:
                     continue
 
-                last_id = last_message_ids.get(chat_id, 0)
-                new_last_id = await check_new_messages(
-                    _bot.client, chat_id, node, last_id
+                durable = getattr(_bot.app, "download_service", None) is not None
+                last_id = (
+                    getattr(node, "last_message_id", 0)
+                    if durable
+                    else last_message_ids.get(chat_id, 0)
                 )
+                with use_language(getattr(node, "language", None)):
+                    new_last_id = await check_new_messages(
+                        _bot.client, chat_id, node, last_id
+                    )
                 last_message_ids[chat_id] = new_last_id
 
         except Exception as e:
@@ -1356,6 +1558,31 @@ async def set_listen_forward_msg(
     if not node:
         return
 
+    if getattr(_bot.app, "download_service", None) is not None:
+        # Persist the new subscription before exposing it to the monitor.
+        previous = _bot.listen_forward_chat.get(node.chat_id)
+        if (
+            previous is not None
+            and previous.from_user_id != message.from_user.id
+            and message.from_user.id != _bot.admin_id
+        ):
+            _bot.remove_task_node(node.task_id)
+            await client.send_message(message.chat.id, "该来源已有其他用户的监听任务，请联系管理员。")
+            return
+        try:
+            # Snapshot the baseline now. A later network outage must not cause
+            # the first successful monitor pass to skip newly arrived messages.
+            cursor = 0
+            async for latest in get_chat_history_v2(_bot.client, node.chat_id, limit=1):
+                cursor = latest.id
+                break
+            _bot.save_listener(node, cursor=cursor)
+        except Exception:
+            _bot.remove_task_node(node.task_id)
+            raise
+        if previous is not None:
+            previous.stop_transmission()
+
     if node.chat_id in _bot.listen_forward_chat:
         _bot.remove_task_node(_bot.listen_forward_chat[node.chat_id].task_id)
 
@@ -1392,6 +1619,194 @@ async def stop(client: pyrogram.Client, message: pyrogram.types.Message):
     )
 
 
+QUEUE_STATES = {
+    "queued": "Queued",
+    "running": "Running",
+    "retry_wait": "Waiting to retry",
+    "paused": "Paused",
+    "cancelled": "Cancelled",
+    "completed": "Completed",
+    "failed": "Failed",
+}
+QUEUE_ACTIONS = {
+    "pause": "Pause",
+    "resume": "Resume",
+    "cancel": "Cancel",
+    "priority": "Prioritize",
+    "retry": "Retry",
+}
+
+
+def can_manage_queue_task(row: dict, user_id: int) -> bool:
+    """A user owns submitted downloads; only the account owner manages scans."""
+    payload = row.get("payload", {})
+    owner = payload.get("from_user_id", payload.get("node", {}).get("from_user_id"))
+    return user_id == _bot.admin_id or (
+        owner is not None and str(owner) == str(user_id)
+    )
+
+
+def queue_task_text(row: dict) -> str:
+    """Render a bounded plain-text summary without interpreting remote filenames."""
+    payload = row.get("payload", {})
+    name = (
+        payload.get("file_name")
+        or payload.get("chat_title")
+        or str(payload.get("chat_id", "下载"))
+    )
+    name = " ".join(str(name).split())[:70]
+    total = row.get("total_bytes") or 0
+    downloaded = row.get("downloaded_bytes") or 0
+    progress = f" · {min(100, downloaded * 100 / total):.0f}%" if total else ""
+    detail = f"#{row['id']} · {_t(QUEUE_STATES.get(row['state'], row['state']))}{progress}\n{name}"
+    phase = (
+        row.get("stage")
+        or row.get("phase")
+        or payload.get("phase")
+        or (row.get("result") or {}).get("phase")
+    )
+    if payload.get("kind") == "scan":
+        phase = "scanning"
+    phase_label = {
+        "scanning": "Scanning",
+        "downloading": "Downloading file",
+        "verifying": "Verifying",
+        "verified": "Verified",
+        "uploading": "Uploading",
+        "uploaded": "Uploaded",
+    }.get(phase or "")
+    if phase_label:
+        detail += f"\n{_t(phase_label)}"
+    if row.get("state") == "retry_wait":
+        remaining = max(0, ceil((row.get("next_run") or 0) - time.time()))
+        detail += f"\n{_t('Retry in seconds')}: {remaining} · {_t('Attempt')} {row.get('attempt', 0)}/{row.get('max_attempts', 3)}"
+    if row.get("error"):
+        detail += f"\n{_t('Reason')}: " + " ".join(str(row["error"]).split())[:120]
+    return detail
+
+
+def queue_task_buttons(row: dict):
+    """Show actions that make sense for the persisted task's current state."""
+    state, task_id = row["state"], row["id"]
+    actions: List[str] = []
+    if state in ("queued", "running", "retry_wait"):
+        actions.extend(("pause", "priority", "cancel"))
+    elif state == "paused":
+        actions.extend(("resume", "priority", "cancel"))
+    elif state in ("failed", "cancelled"):
+        actions.append("retry")
+    buttons = [
+        InlineKeyboardButton(
+            _t(QUEUE_ACTIONS[action]), callback_data=f"queue:{action}:{task_id}"
+        )
+        for action in actions
+    ]
+    buttons.append(
+        InlineKeyboardButton(_t("Refresh"), callback_data=f"queue:detail:{task_id}")
+    )
+    return InlineKeyboardMarkup([buttons])
+
+
+async def queue_command(client: pyrogram.Client, message: pyrogram.types.Message):
+    """List the caller's durable tasks or inspect/control a single task by ID."""
+    store = getattr(_bot.app, "task_store", None)
+    if store is None:
+        await client.send_message(message.chat.id, "任务数据库尚未就绪，请稍后重试。")
+        return
+    args = (message.text or "").split()
+    if len(args) == 1:
+        owner_id = (
+            None if message.from_user.id == _bot.admin_id else message.from_user.id
+        )
+        rows = store.list_tasks(limit=10, owner_id=owner_id)
+        text = "持久化任务队列\n" + (
+            "\n\n".join(queue_task_text(row) for row in rows) if rows else "暂无任务。"
+        )
+        text += "\n\n/queue 任务ID 查看详情\n/queue pause|resume|cancel|priority|retry 任务ID"
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    f"查看 #{row['id']}", callback_data=f"queue:detail:{row['id']}"
+                )
+            ]
+            for row in rows
+        ]
+        await client.send_message(
+            message.chat.id,
+            text,
+            parse_mode=pyrogram.enums.ParseMode.DISABLED,
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+        )
+        return
+    try:
+        if len(args) == 2:
+            action, task_id = "detail", int(args[1])
+        elif len(args) == 3 and args[1] in QUEUE_ACTIONS:
+            action, task_id = args[1], int(args[2])
+        else:
+            raise ValueError("invalid queue command")
+    except ValueError:
+        await client.send_message(
+            message.chat.id,
+            "用法：/queue 或 /queue 任务ID，操作：/queue pause|resume|cancel|priority|retry 任务ID",
+        )
+        return
+    row, error = apply_queue_action(store, task_id, action, message.from_user.id)
+    if error:
+        await client.send_message(message.chat.id, error)
+        return
+    await client.send_message(
+        message.chat.id,
+        queue_task_text(row),
+        reply_markup=queue_task_buttons(row),
+        parse_mode=pyrogram.enums.ParseMode.DISABLED,
+    )
+
+
+def apply_queue_action(store, task_id: int, action: str, user_id: int):
+    """Check ownership before any mutation, including forged callback payloads."""
+    row = store.get(task_id)
+    if row is None or not can_manage_queue_task(row, user_id):
+        return None, "任务不存在或你没有操作权限。"
+    if action == "priority":
+        # A larger priority moves a waiting task before ordinary queued work.
+        store.set_priority(task_id, max(100, int(row.get("priority", 0)) + 100))
+    elif action in ("resume", "retry"):
+        store.resume(task_id)
+    elif action in ("pause", "cancel"):
+        getattr(store, action)(task_id)
+    elif action != "detail":
+        return None, "不支持的任务操作。"
+    return store.get(task_id), None
+
+
+async def queue_callback(client: pyrogram.Client, query: pyrogram.types.CallbackQuery):
+    """Apply a queue button then redraw the same message to avoid chat flooding."""
+    parts = (query.data or "").split(":")
+    store = getattr(_bot.app, "task_store", None)
+    if store is None or len(parts) != 3:
+        return
+    try:
+        task_id = int(parts[2])
+    except ValueError:
+        return
+    row, error = apply_queue_action(store, task_id, parts[1], query.from_user.id)
+    if error:
+        await client.send_message(query.message.chat.id, error)
+        return
+    try:
+        await client.edit_message_text(
+            query.message.chat.id,
+            query.message.id,
+            queue_task_text(row),
+            reply_markup=queue_task_buttons(row),
+            parse_mode=pyrogram.enums.ParseMode.DISABLED,
+        )
+    except pyrogram.errors.MessageNotModified:
+        # Refreshing unchanged progress is expected and should not fail the callback.
+        pass
+
+
 async def stop_task(
     client: pyrogram.Client,
     query: pyrogram.types.CallbackQuery,
@@ -1403,13 +1818,18 @@ async def stop_task(
         buttons: List[InlineKeyboardButton] = []
         temp_buttons: List[InlineKeyboardButton] = []
         for key, value in _bot.task_node.copy().items():
-            if not value.is_finish() and value.task_type is task_type:
+            if (
+                not value.is_finish()
+                and value.task_type is task_type
+                and value.from_user_id == query.from_user.id
+            ):
                 if len(temp_buttons) == 3:
                     buttons.append(temp_buttons)
                     temp_buttons = []
                 temp_buttons.append(
                     InlineKeyboardButton(
-                        f"{key}", callback_data=f"{queryHandler} task {key}"
+                        f"#{key} · {value.chat_id}",
+                        callback_data=f"{queryHandler} task {key}",
                     )
                 )
         if temp_buttons:
@@ -1425,25 +1845,28 @@ async def stop_task(
                 ],
             )
             await client.edit_message_text(
-                query.message.from_user.id,
+                query.message.chat.id,
                 query.message.id,
                 f"{_t('Stop')} {_t(task_type.name)}...",
                 reply_markup=InlineKeyboardMarkup(buttons),
             )
         else:
             await client.edit_message_text(
-                query.message.from_user.id,
+                query.message.chat.id,
                 query.message.id,
                 f"{_t('No Task')}",
             )
     else:
-        task_id = query.data.split(" ")[2]
+        parts = query.data.split()
+        if len(parts) != 3 or parts[1] != "task":
+            return
+        task_id = parts[2]
+        _bot.stop_task(task_id, task_type=task_type, owner_id=query.from_user.id)
         await client.edit_message_text(
-            query.message.from_user.id,
+            query.message.chat.id,
             query.message.id,
-            f"{_t('Stop')} {_t(task_type.name)}...",
+            f"已取消所选 {_t(task_type.name)} 任务。",
         )
-        _bot.stop_task(task_id)
 
 
 async def on_query_handler(
@@ -1460,10 +1883,17 @@ async def on_query_handler(
         None
     """
 
+    await query.answer()
+    if (query.data or "").startswith("queue:"):
+        await queue_callback(client, query)
+        return
     for it in QueryHandler:
         queryHandler = QueryHandlerStr.get_str(it.value)
-        if queryHandler in query.data:
+        if query.data == queryHandler or (query.data or "").startswith(
+            queryHandler + " "
+        ):
             await stop_task(client, query, queryHandler, TaskType(it.value))
+            return
 
 
 async def forward_to_comments(client: pyrogram.Client, message: pyrogram.types.Message):

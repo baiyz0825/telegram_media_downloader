@@ -1,68 +1,44 @@
 <!DOCTYPE html>
-<html lang="en">
-
+<html lang="zh-CN">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>login</title>
-  <link href="{{ url_for('static', filename='login/css/index.css') }}" rel="stylesheet">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>登录 · 下载工作台</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/index.css') }}">
 </head>
-
-<body>
-  <div class="main">
-    <div class="content">
-      <div class="logo">
-        <img src="{{ url_for('static', filename='login/images/login.svg') }}" alt="">
-        <h1 class="title">Telegram Media Downloader</h1>
-        <div class="tips">enter your password.</div>
-      </div>
-      <div class="password-input">
-        <input type="password" class="input-p" placeholder="please enter your password" id="password">
-        <div class="tip">Your password</div>
-      </div>
-      <button class="confirm-btn" onclick="login()">confirm</button>
-    </div>
-  </div>
-
-  <script src="../static/layui/layui.js"></script>
-  <script src="../static/aes/crypto-js-master/crypto-js.js"></script>
-  <script src="../static/request/index.js"></script>
+<body class="login-page">
+  <main class="login-card" style="margin:0">
+    <div class="brand"><span class="brand-symbol">↗</span><span>MEDIA<br><small>DOWNLOADER</small></span></div>
+    <div class="eyebrow">WELCOME BACK</div>
+    <h1>进入下载工作台</h1>
+    <p class="login-description">管理你的媒体，让每一次传输井然有序。</p>
+    <form id="login-form">
+      <label for="password">访问密码</label>
+      <input id="password" type="password" autocomplete="current-password" placeholder="输入工作台访问密码" required autofocus>
+      <button class="button primary" id="submit" type="submit">登录工作台 →</button>
+      <p class="login-error" id="error" role="alert"></p>
+    </form>
+    <p class="login-note">使用配置中的 Web 访问密码。远程访问请通过 HTTPS 连接。</p>
+  </main>
   <script>
-    const $ = layui.$
-    const layer = layui.layer
-
-    //加密方法
-    const encrypt = (word) => {
-      const key = CryptoJS.enc.Utf8.parse("1234123412ABCDEF");
-      const iv = CryptoJS.enc.Utf8.parse('ABCDEF1234123412');
-      let srcs = CryptoJS.enc.Utf8.parse(word);
-      let encrypted = CryptoJS.AES.encrypt(srcs, key, { iv: iv, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 });
-      let hexStr = encrypted.ciphertext.toString();
-      let base64Str = CryptoJS.enc.Base64.stringify(CryptoJS.enc.Hex.parse(hexStr));
-      return base64Str;
-    }
-
-    const login = () => {
-      const pValue = $('#password').val()
-
-      if (!pValue) {
-        layer.msg('please enter your password!')
-        return
-      } else {
-        const encryptData = encrypt(pValue)
-        request('login', 'post', { password: encryptData }).then((res) => {
-          const { code } = res
-          if (code === '1') {
-            const { host } = window.location;
-            window.location.href = 'http://' + host
-          } else {
-            layer.msg('password error!')
-          }
-          $('#password').val('')
-        })
-      }
-    }
+    document.getElementById('login-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = document.getElementById('submit'), error = document.getElementById('error');
+      button.disabled = true; button.textContent = '正在验证…'; error.textContent = '';
+      try {
+        const response = await fetch({{ url_for('login')|tojson }}, {
+          method:'POST', credentials:'same-origin',
+          headers:{'Content-Type':'application/json','X-CSRF-Token':document.querySelector('meta[name="csrf-token"]').content},
+          body:JSON.stringify({password:document.getElementById('password').value})
+        });
+        const data = await response.json();
+        if (response.ok && data.code === '1') { window.location.assign({{ url_for('index')|tojson }}); return; }
+        error.textContent = data.error || '登录失败，请重试';
+        document.getElementById('password').select();
+      } catch (_) { error.textContent = '连接失败，请检查网络后重试'; }
+      finally { button.disabled = false; button.textContent = '登录工作台 →'; }
+    });
   </script>
 </body>
-
 </html>

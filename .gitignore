@@ -3,6 +3,10 @@
 *.pid
 *.cfg
 *.db
+*.db-wal
+*.db-shm
+bot.yaml
+sessions/
 *.env
 .DS_Store
 .cache/

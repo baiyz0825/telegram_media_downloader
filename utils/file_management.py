@@ -2,7 +2,8 @@
 import glob
 import os
 import pathlib
-from hashlib import md5
+
+from module.transfer import file_md5
 
 
 def get_next_name(file_path: str) -> str:
@@ -69,9 +70,13 @@ def manage_duplicate_file(file_path: str):
     )
     if file_path in old_files:
         old_files.remove(file_path)
-    current_file_md5: str = md5(open(file_path, "rb").read()).hexdigest()
+    current_file_md5: str = file_md5(file_path)
     for old_file_path in old_files:
-        old_file_md5: str = md5(open(old_file_path, "rb").read()).hexdigest()
+        if not os.path.isfile(old_file_path) or os.path.getsize(
+            old_file_path
+        ) != os.path.getsize(file_path):
+            continue
+        old_file_md5: str = file_md5(old_file_path)
         if current_file_md5 == old_file_md5:
             os.remove(file_path)
             return old_file_path

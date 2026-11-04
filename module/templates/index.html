@@ -1,313 +1,183 @@
 <!DOCTYPE html>
-<html>
-
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Telegram Media Downloader</title>
-  <link href="static/layui/css/layui.css" rel="stylesheet">
-  <link href="static/css/index.css" rel="stylesheet">
-  <style>
-    body {
-      padding: 6px 16px;
-    }
-  </style>
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>下载工作台 · Telegram Media Downloader</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/index.css') }}">
 </head>
-
 <body>
-  <div class="layui-tab" lay-filter="telegram_media_downloader">
-    <div class="header-title layui-tab-brief">
-      <ul class="layui-tab-title">
-        <li class="layui-this">Downloading</li>
-        <li>Downloaded</li>
-        <!-- <li>Config</li> -->
-      </ul>
-      <div class="stop-btn" id="download_state" data-value="{{ download_state }}" onclick="download_state_change(this)"> {{ download_state }} </div>
-    </div>
-    <div class="layui-tab-content" style="padding: 0;">
-      <div class="layui-tab-item layui-show">
-        <table class="layui-hide" id="download_list" lay-filter="download_list"></table>
-      </div>
-      <div class="layui-tab-item">
-        <table class="layui-hide" id="already_download_list" lay-filter="already_download_list"></table>
-      </div>
-      <!-- <div class="layui-tab-item">
-        <form class="layui-form" action="">
-        under development
-      </form>
-      </div> -->
-    </div>
-  </div>
-
-  <div class="layui-footer">
-    <div class="layui-row layui-col-space1">
-      <div class="layui-col-md2">
-        <p>Telegram Media Downloader V <b id="app_version" style="color: #009688;">undefined</b>
-      </div>
-      <div class="layui-col-md7">
-      </div>
-      <div class="layui-col-md3">
-        <div style="padding: 5px; float: right;">
-          <!-- <i class="layui-icon layui-icon-upload-circle" style="font-size: 16px; color: #1E9FFF; font-weight: 700;">
-            <i id="upload_speed_title" style="color: black;"> 0.00 B/s </i>
-          </i> -->
-
-          <i class="layui-icon layui-icon-download-circle"
-            style="font-size: 16px; color: #5FB878; font-weight: 700; margin-left: 15px;">
-            <i id="download_speed_title" style="color: black;"> 0.00 B/s </i>
-          </i>
-
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <script src="static/layui/layui.js"></script>
+  <aside class="sidebar">
+    <a class="brand" href="{{ url_for('index') }}"><span class="brand-symbol">↗</span><span>MEDIA<br><small>DOWNLOADER</small></span></a>
+    <div class="sidebar-label">工作空间</div>
+    <nav aria-label="任务导航" id="filters">
+      <button class="nav-item active" data-state=""><span>◫</span>全部任务<b id="nav-total">0</b></button>
+      <button class="nav-item" data-state="running"><span>↓</span>正在下载<b id="nav-running">0</b></button>
+      <button class="nav-item" data-state="queued"><span>≡</span>等待下载<b id="nav-queued">0</b></button>
+      <button class="nav-item" data-state="retry_wait"><span>◷</span>等待重试<b id="nav-retry_wait">0</b></button>
+      <button class="nav-item" data-state="paused"><span>Ⅱ</span>已暂停<b id="nav-paused">0</b></button>
+      <button class="nav-item" data-state="completed"><span>✓</span>已完成<b id="nav-completed">0</b></button>
+      <button class="nav-item" data-state="failed"><span>!</span>下载失败<b id="nav-failed">0</b></button>
+      <button class="nav-item" data-state="cancelled"><span>×</span>已取消<b id="nav-cancelled">0</b></button>
+    </nav>
+    <div class="sidebar-bottom"><span class="version">VERSION {{ version }}</span><p>每一份媒体，都妥善抵达。</p>{% if login_enabled %}<button class="logout" id="logout">退出登录 ↗</button>{% endif %}</div>
+  </aside>
+  <main>
+    <header class="topbar"><span>Telegram / 下载工作台</span><div class="connection" id="connection" role="status"><i></i><span>正在连接</span></div></header>
+    <section class="page-heading"><div><div class="eyebrow">YOUR MEDIA, ORGANIZED</div><h1>下载工作台<span> / </span></h1><p>从排队到归档，掌握每一项传输。</p></div><div class="heading-actions"><button class="button" id="refresh">↻ 刷新</button><button class="button primary" id="bulk">Ⅱ 全部暂停</button></div></section>
+    <section class="metrics" aria-label="下载概览">
+      <article class="metric"><span>正在传输 <i class="live-dot"></i></span><strong id="metric-running">—</strong><small>个文件正在下载</small></article>
+      <article class="metric"><span>下载速度 <span>↓</span></span><strong id="metric-speed">—<em> /s</em></strong><small id="upload-speed">上传 — /s</small></article>
+      <article class="metric"><span>等待处理 <span>≡</span></span><strong id="metric-queued">—</strong><small id="retry-count">含等待重试的任务</small></article>
+      <article class="metric accent"><span>已完成 <span>✓</span></span><strong id="metric-completed">—</strong><small id="failed-count">所有任务都值得被关注</small></article>
+    </section>
+    <section class="task-panel">
+      <div class="panel-toolbar"><div><h2 id="list-title">全部任务</h2><span class="subtle" id="result-count">正在读取任务…</span></div><label class="search"><span>⌕</span><input id="search" type="search" placeholder="搜索文件、路径或来源" aria-label="搜索任务" maxlength="200"></label></div>
+      <div class="table-scroll"><table><thead><tr><th>文件 / 来源</th><th>状态</th><th>传输进度</th><th>操作</th></tr></thead><tbody id="task-rows"></tbody></table></div>
+      <div class="empty-state" id="empty" hidden><div>↧</div><h3>这里还没有任务</h3><p>向机器人发送媒体或消息链接，任务会自动出现在这里。</p></div>
+      <footer class="pagination"><span id="page-info">第 1 页</span><div><button class="button compact" id="prev" disabled>← 上一页</button><button class="button compact" id="next" disabled>下一页 →</button></div></footer>
+    </section>
+    <p class="page-note" id="network-status" role="status">正在读取 Telegram 连接状态…</p>
+    <p class="page-note">任务记录保存在本机 · 页面每 2 秒更新 · 暂停与取消会在当前传输检查点生效</p>
+    <div class="toast" id="toast" role="status" hidden></div>
+  </main>
   <script>
-
-    layui.use(['table', 'element'], function () {
-      var table = layui.table;
-      var element = layui.element;
-      var layer = layui.layer;
-      var $ = layui.$;
-      var already_download_list_data = new Array()
-      var download_list_table_data = new Array()
-
-      $.ajax({
-        url: "get_app_version"
-        , type: "get"
-        , async: false
-        , dataType: "text"
-        , success: function (result) {
-          $("#app_version").html(result)
-        }
-      });
-
-      download_state_change = function(e) {
-        $.ajax({
-        url: "set_download_state?state=" + e.dataset.value
-        , type: "post"
-        , async: false
-        , dataType: "text"
-        , success: function (result) {
-          $("#download_state").html(result)
-          e.dataset.value=result
-        }
-      });
+  (() => {
+    'use strict';
+    const $ = id => document.getElementById(id);
+    const csrf = document.querySelector('meta[name="csrf-token"]').content;
+    const stateNames = {queued:'等待下载',running:'正在下载',retry_wait:'等待重试',paused:'已暂停',cancelled:'已取消',completed:'已完成',failed:'下载失败'};
+    let state = '', page = 1, total = 0, paused = false, busy = false, pending = false, searchTimer, toastTimer;
+    const limit = 25;
+    const samples = new Map();
+    function bytes(value) {
+      let number = Number(value) || 0, unit = 0;
+      const units = ['B','KB','MB','GB','TB'];
+      while (number >= 1024 && unit < units.length - 1) { number /= 1024; unit++; }
+      return number.toFixed(unit ? 1 : 0) + ' ' + units[unit];
     }
-
-      tableIns = table.render({
-        elem: '#download_list'
-        , data: download_list_table_data
-        , title: 'download_list'
-        , height: 'full-160'
-        , limit: 10000
-        , cols: [[
-          { field: 'chat', title: 'chat', width: 100 },
-          { field: 'id', title: 'id', width: 100 }
-          , { field: 'filename', title: 'file name', align: 'center' }
-          , { field: 'total_size', title: 'total byte', align: 'center' }
-          , {
-            field: 'download_progress', title: 'download progress', align: 'center', templet: function (d) {
-              var ys = '';
-              if (30 < d.download_progress && d.download_progress < 100) {
-                ys = 'layui-bg-blue'
-              } else if (0 < d.download_progress && d.download_progress <= 30) {
-                ys = 'layui-bg-red'
-              }
-              else if (100 == d.download_progress) {
-                ys = 'layui-bg-green'
-              }
-              return '<div class="layui-progress layui-progress-big" lay-showpercent="true"  lay-filter="down-' + d.id + '"><div class="layui-progress-bar ' + ys + '" lay-percent="' + d.download_progress + '%"></div></div>'
-            }
-          }
-          , { field: 'download_speed', title: 'download speed', align: 'center' }
-        ]]
-        , done: function (res, currentCount) {
-          element.render()
-        }
-      });
-
-      table.render({
-        elem: '#already_download_list'
-        , data: already_download_list_data
-        , title: 'already_download_list'
-        , height: 'full-160'
-        , limit: 10000
-        , cols: [[
-
-          { field: 'id', title: 'id', width: 100 }
-          , { field: 'filename', title: 'file name', align: 'center' }
-          , { field: 'total_size', title: 'total size', align: 'center' }
-          , { field: 'save_path', title: 'save path', align: 'center' }
-        ]], done: function (res, currentCount) {
-          element.render()
-        }
-      });
-
-      function update_download_list() {
-        $.ajax({
-          url: "get_download_list?already_down=false"
-          , type: "get"
-          , async: false
-          , dataType: "json"
-          , success: function (result) {
-            // first remove finish and update
-            for (var j = 0, len2 = download_list_table_data.length; j < len2; j++) {
-              find_iter = false
-              for (var i = 0, len = result.length; i < len; i++) {
-                if (result[i].chat == download_list_table_data[j].chat && result[i].id == download_list_table_data[j].id) {
-                  download_list_table_data[j].download_progress = result[i].download_progress
-                  var progress = download_list_table_data[j].download_progress
-                  element.progress('down-' + result[i].chat + '-' + result[i].id, progress + '%');
-
-                  var download_speed_obj = $('div[lay-filter="down_speed-' + result[i].chat + '-' + result[i].id + '"]')
-                  download_speed_obj.html(result[i].download_speed)
-
-                  if (progress == 100) {
-                    var device_obj = $('div[lay-filter="down-' + result[i].chat + '-' + result[i].id + '"] div')
-                    device_obj.removeClass("layui-bg-blue")
-                    device_obj.addClass("layui-bg-green")
-                    obj = $('div[lay-id="download_list"]  tr[data-index="' + result[i].chat + '-' + result[i].id + '"]')
-                    obj.remove()
-                  }
-                  find_iter = true
-                  break
-                }
-              }
-
-            }
-
-            // new task
-            for (var i = 0, len = result.length; i < len; i++) {
-              find_iter = false
-              for (var j = 0, len2 = download_list_table_data.length; j < len2; j++) {
-                if (result[i].chat == download_list_table_data[j].chat && result[i].id == download_list_table_data[j].id) {
-                  find_iter = true
-                  break
-                }
-              }
-
-              if (find_iter || result[i].download_progress == 100) {
-                continue;
-              }
-              // not found
-              obj = $('div[lay-id="download_list"]  .layui-table-body .layui-table tbody')
-              var tr = ' <tr data-index="' + result[i].chat + '-' + result[i].id + '">' +
-                '<td data-field="id" data-key="1-0-0" class=""><div class="layui-table-cell laytable-cell-1-0-0">' + result[i].chat + '</div></td>' +
-                '<td data-field="id" data-key="1-0-1" class=""><div class="layui-table-cell laytable-cell-1-0-1">' + result[i].id + '</div></td>' +
-                '<td data-field="filename" data-key="1-0-2" class=""><div class="layui-table-cell laytable-cell-1-0-2" align="center">' + result[i].filename + '</div></td>' +
-                '<td data-field="total_size" data-key="1-0-3" class=""><div class="layui-table-cell laytable-cell-1-0-3" align="center">' + result[i].total_size + '</div></td>' +
-                '<td data-field="download_progress" data-key="1-0-4" data-content="' + result[i].download_progress + '" class=""><div class="layui-table-cell laytable-cell-1-0-4" align="center"><div class="layui-progress layui-progress-big" lay-showpercent="true" lay-filter="down-' + result[i].chat + '-' + result[i].id + '"><div class="layui-progress-bar layui-bg-blue" lay-percent="' + result[i].download_progress + '%" style="width: ' + result[i].download_progress + '%;"><span class="layui-progress-text">' + result[i].download_progress + '%</span></div></div></div></td>' +
-                '<td data-field="download_speed" data-key="1-0-5" class=""><div class="layui-table-cell laytable-cell-1-0-5" align="center"lay-filter="down_speed-' + result[i].chat + '-' + result[i].id + '">' + result[i].download_speed + '</div></td>' +
-                "  </tr>";
-              obj.append(tr)
-              download_list_table_data.push(result[i])
-
-              if (download_list_table_data.length == 1) {
-                $(".layui-none").remove()
-              }
-
-              element.render()
-
-            }
-
-            element.render()
-          }
-        });
-
-      };
-
-
-      function update_download_status() {
-        $.ajax({
-          url: "get_download_status"
-          , type: "get"
-          , async: false
-          , dataType: "json"
-          , success: function (result) {
-            $("#download_speed_title").html(result.download_speed)
-          }
-        });
-
-      };
-
-
-      var update_download_list_int = self.setInterval(update_download_list, 1000);
-      var update_download_status_int = self.setInterval(update_download_status, 1000);
-      var update_already_download_list_int = 0;
-
-
-      function update_already_download_list() {
-        $.ajax({
-          url: "get_download_list?already_down=true"
-          , type: "get"
-          , async: false
-          , dataType: "json"
-          , success: function (result) {
-            // if not exist then add
-            for (var i = 0, len = result.length; i < len; i++) {
-              if (result[i].download_progress != 100) {
-                continue
-              }
-
-              find_iter = false
-
-              for (var j = 0, len2 = already_download_list_data.length; j < len2; j++) {
-                if (result[i].chat == download_list_table_data[i].chat && result[i].id == already_download_list_data[j].id) {
-                  find_iter = true
-                  break
-                }
-              }
-
-              if (find_iter) {
-                continue;
-              }
-              // not found
-              obj = $('div[lay-id="already_download_list"]  .layui-table-body .layui-table tbody')
-              var tr = ' <tr data-index="' + result[i].chat + '-' + result[i].id + '">' +
-                '<td data-field="id" data-key="2-0-0" class=""><div class="layui-table-cell laytable-cell-2-0-0">' + result[i].id + '</div></td>' +
-                '<td data-field="filename" data-key="2-0-1" class=""><div class="layui-table-cell laytable-cell-2-0-1" align="center">' + result[i].filename + '</div></td>' +
-                '<td data-field="total_size" data-key="2-0-2" class=""><div class="layui-table-cell laytable-cell-2-0-2" align="center">' + result[i].total_size + '</div></td>' +
-                '<td data-field="save_path" data-key="2-0-3" class=""><div class="layui-table-cell laytable-cell-2-0-3" align="center">' + result[i].save_path + '</div></td>' +
-                "  </tr>";
-              obj.append(tr)
-
-              already_download_list_data.push(result[i])
-
-              if (already_download_list_data.length == 1) {
-                $(".layui-none").remove()
-              }
-              element.render()
-            }
-
-            element.render()
-          }
-        });
-
-      };
-
-      element.on('tab(telegram_media_downloader)', function (data) {
-        if (data.index != 0) {
-          clearInterval(update_download_list_int);
-        }
-
-        if (data.index == 0) {
-          update_download_list_int = self.setInterval(update_download_list, 1000);
-        }
-
-        if (data.index != 1) {
-          clearInterval(update_already_download_list_int);
-        }
-
-        if (data.index == 1) {
-          update_already_download_list_int = self.setInterval(update_already_download_list, 1000);
-        }
-
-      });
-
+    function text(tag, value, className) {
+      const element = document.createElement(tag); element.textContent = value;
+      if (className) element.className = className;
+      return element;
+    }
+    function toast(message) {
+      $('toast').textContent = message; $('toast').hidden = false;
+      clearTimeout(toastTimer); toastTimer = setTimeout(() => {$('toast').hidden = true;}, 4500);
+    }
+    async function api(path, method='GET') {
+      const response = await fetch(path, {method, credentials:'same-origin', headers:{'X-CSRF-Token':csrf, 'Accept':'application/json'}, cache:'no-store'});
+      const data = await response.json().catch(() => ({}));
+      if (response.status === 401) { window.location.assign({{ url_for('login')|tojson }}); throw new Error('登录已过期'); }
+      if (!response.ok) throw new Error(data.error || '请求失败，请稍后重试');
+      return data;
+    }
+    function setConnection(ok) {
+      $('connection').classList.toggle('offline', !ok);
+      $('connection').lastElementChild.textContent = ok ? '已连接 · 实时更新' : '连接中断 · 自动重连';
+    }
+    async function action(id, name, button) {
+      if (name === 'cancel' && !window.confirm('取消这个任务？已下载的临时文件会保留。')) return;
+      button.disabled = true;
+      try { await api('api/tasks/' + id + '/' + name, 'POST'); toast('操作已提交'); await refresh(); }
+      catch (error) { toast(error.message); }
+      finally { button.disabled = false; }
+    }
+    function addAction(cell, row, name, label) {
+      const button = text('button', label, 'task-action' + (name === 'cancel' ? ' danger' : ''));
+      button.type = 'button'; button.setAttribute('aria-label', label + '任务 #' + row.id);
+      button.addEventListener('click', () => action(row.id, name, button)); cell.append(button);
+    }
+    function render(rows) {
+      const fragment = document.createDocumentFragment(), now = Date.now(), visibleIds = new Set();
+      for (const row of rows) {
+        visibleIds.add(row.id);
+        const payload = row.payload || {}, tr = document.createElement('tr'), fileCell = document.createElement('td');
+        const path = row.path || payload.file_name || '', filename = path.split(/[\\/]/).pop() || '消息 #' + (payload.message_id || row.id);
+        const file = text('div', '', 'file-name');
+        file.append(text('span', row.state === 'completed' ? '✓' : '↓', 'file-icon'), text('strong', filename));
+        file.title = path || filename; fileCell.append(file);
+        fileCell.append(text('div', '#' + row.id + ' · 来源 ' + (payload.source_name || payload.chat_title || payload.chat_id || row.group_id || 'Telegram') + ' · 尝试 ' + row.attempt + '/' + row.max_attempts, 'file-meta'));
+        if (row.error) { const error = text('div', row.error, 'task-error'); error.title = row.error; fileCell.append(error); }
+        tr.append(fileCell);
+        const statusCell = document.createElement('td'); statusCell.append(text('span', stateNames[row.state] || row.state, 'badge ' + row.state));
+        const stages = {downloading:'下载媒体',verified:'文件已校验',uploading:'上传媒体',uploaded:'上传已完成',scan:'扫描消息',download:'下载媒体',upload:'上传媒体',forward:'转发消息',verify:'校验文件',cloud_upload:'上传云盘',fetch:'获取消息'};
+        if (row.stage && row.state === 'running') statusCell.append(text('small', stages[row.stage] || row.stage, 'retry-time'));
+        if (row.state === 'retry_wait' && row.next_run) statusCell.append(text('small', Math.max(0, Math.ceil(row.next_run - now / 1000)) + ' 秒后重试', 'retry-time'));
+        tr.append(statusCell);
+        const progressCell = document.createElement('td'), downloaded = Math.max(0, Number(row.downloaded_bytes) || 0), size = Math.max(0, Number(row.total_bytes) || 0);
+        const percent = row.state === 'completed' ? 100 : size ? Math.min(100, downloaded / size * 100) : 0;
+        const progress = text('div', '', 'progress-track'), bar = text('div', '', 'progress-fill ' + row.state);
+        progress.setAttribute('role','progressbar'); progress.setAttribute('aria-label', filename); progress.setAttribute('aria-valuenow', percent.toFixed(1)); progress.setAttribute('aria-valuemin','0'); progress.setAttribute('aria-valuemax','100');
+        bar.style.width = percent + '%'; progress.append(bar); progressCell.append(progress);
+        const last = samples.get(row.id); let speed = 0;
+        if (last && now > last.time && downloaded >= last.bytes && row.state === 'running') speed = (downloaded - last.bytes) / ((now - last.time) / 1000);
+        samples.set(row.id, {bytes:downloaded,time:now});
+        progressCell.append(text('div', bytes(downloaded) + ' / ' + (size ? bytes(size) : '大小待获取') + ' · ' + percent.toFixed(1) + '%' + (speed ? ' · ' + bytes(speed) + '/s' : ''), 'progress-caption'));
+        tr.append(progressCell);
+        const actions = text('td', '', 'actions');
+        if (['queued','running','retry_wait'].includes(row.state)) addAction(actions,row,'pause','暂停');
+        if (row.state === 'paused') addAction(actions,row,'resume','继续');
+        if (['failed','cancelled'].includes(row.state)) addAction(actions,row,'retry','重试');
+        if (['queued','retry_wait'].includes(row.state)) addAction(actions,row,'promote','插队');
+        if (['queued','running','retry_wait','paused'].includes(row.state)) addAction(actions,row,'cancel','取消');
+        if (row.state === 'completed') actions.append(text('span','已归档','subtle'));
+        tr.append(actions); fragment.append(tr);
+      }
+      for (const id of samples.keys()) if (!visibleIds.has(id)) samples.delete(id);
+      $('task-rows').replaceChildren(fragment); $('empty').hidden = rows.length !== 0;
+      $('empty').querySelector('h3').textContent = $('search').value ? '没有匹配的任务' : '这里还没有任务';
+      $('empty').querySelector('p').textContent = state || $('search').value ? '试试其他分类或搜索关键词。' : '向机器人发送媒体或消息链接，任务会自动出现在这里。';
+    }
+    async function refresh() {
+      if (busy) { pending = true; return; }
+      busy = true;
+      try {
+        const params = new URLSearchParams({page,limit,state,search:$('search').value.trim()});
+        const [list, stats] = await Promise.all([api('api/tasks?' + params), api('api/stats')]);
+        total = list.total; render(list.items);
+        const queue = stats.queue;
+        for (const key of ['total',...Object.keys(stateNames)]) $('nav-' + key).textContent = queue[key] || 0;
+        $('metric-running').textContent = queue.running || 0;
+        $('metric-speed').replaceChildren(text('span',bytes(stats.download_speed)),text('em',' /s'));
+        $('upload-speed').textContent = '上传 ' + bytes(stats.upload_speed) + ' /s';
+        $('metric-queued').textContent = (queue.queued || 0) + (queue.retry_wait || 0);
+        $('retry-count').textContent = '其中 ' + (queue.retry_wait || 0) + ' 项等待重试';
+        $('metric-completed').textContent = queue.completed || 0;
+        $('failed-count').textContent = queue.failed ? queue.failed + ' 项失败，可在列表中重试' : '所有任务都值得被关注';
+        const network = stats.network || {};
+        let networkText = 'Telegram ' + (network.connected === true ? '已连接' : network.connected === false ? '连接中断' : '连接状态暂不可用');
+        networkText += ' · 下载并发 ' + (network.download_limit || '—') + ' / 上传并发 ' + (network.upload_limit || '—');
+        if (network.recent_error) networkText += ' · 最近异常：' + network.recent_error + (network.next_retry ? '（' + Math.max(0,Math.ceil(network.next_retry - Date.now()/1000)) + ' 秒后重试）' : '');
+        $('network-status').textContent = networkText;
+        paused = stats.paused; $('bulk').textContent = paused ? '▶ 全部继续' : 'Ⅱ 全部暂停';
+        $('result-count').textContent = total + ' 项任务';
+        $('page-info').textContent = '第 ' + page + ' / ' + Math.max(1,Math.ceil(total / limit)) + ' 页 · 每页 ' + limit + ' 项';
+        $('prev').disabled = page <= 1; $('next').disabled = page * limit >= total;
+        setConnection(true);
+      } catch (error) { setConnection(false); $('result-count').textContent = error.message; }
+      finally { busy = false; if (pending) {pending = false; refresh();} }
+    }
+    $('filters').addEventListener('click', event => {
+      const target = event.target.closest('[data-state]'); if (!target) return;
+      state = target.dataset.state; page = 1;
+      for (const item of $('filters').children) item.classList.toggle('active',item === target);
+      $('list-title').textContent = stateNames[state] || '全部任务'; refresh();
     });
+    $('search').addEventListener('input', () => {clearTimeout(searchTimer); searchTimer = setTimeout(() => {page = 1;refresh();},300);});
+    $('prev').addEventListener('click', () => {if (page > 1) {page--;refresh();}});
+    $('next').addEventListener('click', () => {if (page * limit < total) {page++;refresh();}});
+    $('refresh').addEventListener('click',refresh);
+    $('bulk').addEventListener('click', async () => {
+      $('bulk').disabled = true;
+      try {await api('api/tasks/bulk/' + (paused ? 'resume' : 'pause'),'POST'); await refresh();}
+      catch (error) {toast(error.message);} finally {$('bulk').disabled = false;}
+    });
+    if ($('logout')) $('logout').addEventListener('click',async () => {try {await api('logout','POST');window.location.assign({{ url_for('login')|tojson }});} catch(error) {toast(error.message);}});
+    document.addEventListener('visibilitychange',() => {if (!document.hidden) refresh();});
+    refresh(); setInterval(() => {if (!document.hidden) refresh();},2000);
+  })();
   </script>
 </body>
-
 </html>

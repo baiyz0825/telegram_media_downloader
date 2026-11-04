@@ -3,16 +3,25 @@ import asyncio
 import functools
 import importlib
 import inspect
+import json
 import os
+import posixpath
 import re
+import tempfile
 from asyncio import subprocess
-from subprocess import Popen
 from typing import Callable
 from zipfile import ZipFile
 
 from loguru import logger
 
+from module.transfer import file_md5
 from utils import platform
+
+
+async def _in_thread(function, *args):
+    """Run blocking archive/hash/provider work on Python 3.8 and newer."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(function, *args))
 
 
 # pylint: disable = R0902
@@ -38,6 +47,7 @@ class CloudDriveConfig:
         self.upload_adapter = upload_adapter
         self.dir_cache: dict = {}  # for remote mkdir
         self.total_upload_success_file_count = 0
+        self.last_upload_verified = False
         self.aligo = None
 
     def pre_run(self):
@@ -57,15 +67,60 @@ class CloudDrive:
             drive_config.aligo = Aligo()
 
     @staticmethod
-    def rclone_mkdir(drive_config: CloudDriveConfig, remote_dir: str):
+    async def rclone_mkdir(drive_config: CloudDriveConfig, remote_dir: str):
         """mkdir in remote"""
-        with Popen(
-            f'"{drive_config.rclone_path}" mkdir "{remote_dir}/"',
-            shell=True,
+        code, _ = await CloudDrive._run_rclone(drive_config, "mkdir", remote_dir)
+        if code:
+            raise OSError("rclone mkdir failed with exit code %s" % code)
+
+    @staticmethod
+    async def _terminate(proc):
+        if proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                return
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+
+    @staticmethod
+    async def _run_rclone(
+        drive_config, *args, progress_callback=None, progress_args=()
+    ):
+        """Arguments never pass through a shell; cancellation reaps the child."""
+        proc = await asyncio.create_subprocess_exec(
+            drive_config.rclone_path,
+            *args,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-        ):
-            pass
+        )
+        output = bytearray()
+        try:
+            if proc.stdout:
+                async for line in proc.stdout:
+                    # Only single-file metadata and a small log tail are needed.
+                    output.extend(line)
+                    if len(output) > 1024 * 1024:
+                        del output[: len(output) - 1024 * 1024]
+                    if progress_callback:
+                        match = re.search(
+                            r"Transferred:\s*(.*?) / (.*?),\s*(.*?)%,\s*(.*?/s)?, ETA (.*?)$",
+                            line.decode(errors="replace").strip(),
+                        )
+                        if match:
+                            result = progress_callback(*match.groups(), *progress_args)
+                            if inspect.isawaitable(result):
+                                await result
+            return await proc.wait(), bytes(output)
+        except BaseException:
+            await asyncio.shield(CloudDrive._terminate(proc))
+            raise
 
     @staticmethod
     def aligo_mkdir(drive_config: CloudDriveConfig, remote_dir: str):
@@ -79,11 +134,14 @@ class CloudDrive:
         Zip local file
         """
 
-        file_path_without_extension = os.path.splitext(local_file_path)[0]
-        zip_file_name = file_path_without_extension + ".zip"
-
+        descriptor, zip_file_name = tempfile.mkstemp(
+            prefix=".upload-",
+            suffix=".zip",
+            dir=os.path.dirname(os.path.abspath(local_file_path)),
+        )
+        os.close(descriptor)
         with ZipFile(zip_file_name, "w") as zip_writer:
-            zip_writer.write(local_file_path)
+            zip_writer.write(local_file_path, arcname=os.path.basename(local_file_path))
 
         return zip_file_name
 
@@ -97,79 +155,102 @@ class CloudDrive:
         progress_args: tuple = (),
     ) -> bool:
         """Use Rclone upload file"""
-        upload_status: bool = False
+        drive_config.last_upload_verified = False
         try:
-            remote_dir = (
-                drive_config.remote_dir
-                + "/"
-                + os.path.dirname(local_file_path).replace(save_path, "")
-                + "/"
-            ).replace("\\", "/")
-
-            if not drive_config.dir_cache.get(remote_dir):
-                CloudDrive.rclone_mkdir(drive_config, remote_dir)
-                drive_config.dir_cache[remote_dir] = True
-
-            zip_file_path: str = ""
+            relative = os.path.relpath(
+                os.path.abspath(local_file_path), os.path.abspath(save_path)
+            )
+            if relative == ".." or relative.startswith(".." + os.sep):
+                relative = os.path.basename(local_file_path)
+            remote_file = (
+                drive_config.remote_dir.rstrip("/") + "/" + relative.replace("\\", "/")
+            )
             file_path = local_file_path
             if drive_config.before_upload_file_zip:
-                zip_file_path = CloudDrive.zip_file(local_file_path)
-                file_path = zip_file_path
-            else:
-                file_path = local_file_path
-
-            cmd = (
-                f'"{drive_config.rclone_path}" copy "{file_path}" '
-                f'"{remote_dir}/" --create-empty-src-dirs --ignore-existing --progress'
+                file_path = await _in_thread(CloudDrive.zip_file, local_file_path)
+                remote_file = os.path.splitext(remote_file)[0] + ".zip"
+            remote_dir = posixpath.dirname(remote_file)
+            if not drive_config.dir_cache.get(remote_dir):
+                await CloudDrive.rclone_mkdir(drive_config, remote_dir)
+                drive_config.dir_cache[remote_dir] = True
+            before = os.stat(file_path)
+            digest = await _in_thread(file_md5, file_path)
+            # copyto targets exactly one object; no --ignore-existing shortcut.
+            code, output = await CloudDrive._run_rclone(
+                drive_config,
+                "copyto",
+                file_path,
+                remote_file,
+                "--checksum",
+                "--progress",
+                progress_callback=progress_callback,
+                progress_args=progress_args,
             )
-            proc = await asyncio.create_subprocess_shell(
-                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            if code:
+                logger.error(
+                    "rclone copyto failed ({}): {}",
+                    code,
+                    output.decode(errors="replace")[-1000:],
+                )
+                return False
+            code, output = await CloudDrive._run_rclone(
+                drive_config, "lsjson", remote_file, "--stat", "--hash"
             )
-            if proc.stdout:
-                async for output in proc.stdout:
-                    s = output.decode(errors="replace")
-                    print(s)
-                    if "Transferred" in s and "100%" in s and "1 / 1" in s:
-                        logger.info(f"upload file {local_file_path} success")
-                        drive_config.total_upload_success_file_count += 1
-                        if drive_config.after_upload_file_delete:
-                            os.remove(local_file_path)
-                        if drive_config.before_upload_file_zip:
-                            os.remove(zip_file_path)
-                        upload_status = True
+            if code:
+                return False
+            remote = json.loads(output)
+            after = os.stat(file_path)
+            if (
+                remote.get("IsDir")
+                or remote.get("Size") != before.st_size
+                or (before.st_size, before.st_mtime_ns)
+                != (after.st_size, after.st_mtime_ns)
+            ):
+                logger.error(
+                    "Remote size or local stability verification failed: {}",
+                    local_file_path,
+                )
+                return False
+            hashes = {
+                key.lower(): value
+                for key, value in (remote.get("Hashes") or {}).items()
+            }
+            remote_md5 = hashes.get("md5")
+            if remote_md5 and remote_md5.lower() != digest:
+                logger.error("Remote MD5 mismatch: {}", local_file_path)
+                return False
+            drive_config.last_upload_verified = (
+                bool(remote_md5) and file_path == local_file_path
+            )
+            drive_config.total_upload_success_file_count += 1
+            if remote_md5:
+                if drive_config.after_upload_file_delete:
+                    # If a ZIP was uploaded, retain a concurrently changed original.
+                    if file_path == local_file_path:
+                        os.remove(local_file_path)
                     else:
-                        pattern = (
-                            r"Transferred: (.*?) / (.*?), (.*?)%, (.*?/s)?, ETA (.*?)$"
+                        logger.info(
+                            "Uploaded ZIP verified; original retained: {}",
+                            local_file_path,
                         )
-                        transferred_match = re.search(pattern, s)
-
-                        if transferred_match:
-                            if progress_callback:
-                                func = functools.partial(
-                                    progress_callback,
-                                    transferred_match.group(1),
-                                    transferred_match.group(2),
-                                    transferred_match.group(3),
-                                    transferred_match.group(4),
-                                    transferred_match.group(5),
-                                    *progress_args,
-                                )
-
-                            if inspect.iscoroutinefunction(progress_callback):
-                                await func()
-
-            await proc.wait()
+                if file_path != local_file_path:
+                    os.remove(file_path)
+            else:
+                logger.warning(
+                    "Remote has no MD5; size verified, retaining local source: {}",
+                    file_path,
+                )
+            return True
         except Exception as e:
             logger.error(f"{e.__class__} {e}")
             return False
-
-        return upload_status
 
     @staticmethod
     def aligo_upload_file(
         drive_config: CloudDriveConfig, save_path: str, local_file_path: str
     ):
         """aliyun upload file"""
+        drive_config.last_upload_verified = False
         upload_status: bool = False
         if not drive_config.aligo:
             logger.warning("please config aligo! see README.md")
@@ -205,12 +286,9 @@ class CloudDrive:
 
             if len(res) > 0:
                 drive_config.total_upload_success_file_count += len(res)
-                if drive_config.after_upload_file_delete:
-                    os.remove(local_file_path)
-
-                if drive_config.before_upload_file_zip:
-                    os.remove(zip_file_path)
-
+                logger.warning(
+                    "Aligo returned upload results without remote hash verification; retaining local source"
+                )
                 upload_status = True
 
         except Exception as e:
@@ -249,6 +327,8 @@ class CloudDrive:
                 drive_config, save_path, local_file_path
             )
         elif drive_config.upload_adapter == "aligo":
-            ret = CloudDrive.aligo_upload_file(drive_config, save_path, local_file_path)
+            ret = await _in_thread(
+                CloudDrive.aligo_upload_file, drive_config, save_path, local_file_path
+            )
 
         return ret
